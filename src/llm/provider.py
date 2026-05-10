@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from threading import Lock
 
 import httpx
 
 from src.config import settings
+from src.model_catalog import resolve_model
 from src.llm.tools import execute_builtin_tool, try_extract_tool_intent
 
 
@@ -17,6 +20,10 @@ class GenerationResult:
 
 
 class LLMProvider:
+    def __init__(self) -> None:
+        self._rr_lock = Lock()
+        self._rr_index_by_pool: dict[str, int] = {}
+
     async def stream_generate(self, prompt: str, model: str) -> AsyncIterator[str]:
         tool_intent = try_extract_tool_intent(prompt)
         if tool_intent is not None:
@@ -26,8 +33,27 @@ class LLMProvider:
                 yield chunk
             return
 
-        if settings.openai_api_key:
-            async for chunk in self._stream_openai_compatible(prompt=prompt, model=model):
+        profile = resolve_model(settings.model_catalog, model)
+        if profile is not None and profile.provider == "openai_compatible":
+            api_key = self._pick_api_key(profile.api_key_env)
+            if api_key:
+                async for chunk in self._stream_openai_compatible(
+                    prompt=prompt,
+                    profile_model_name=profile.model_name,
+                    profile_base_url=profile.base_url,
+                    api_key=api_key,
+                ):
+                    yield chunk
+                return
+
+        # Compatibility path when old model IDs are passed directly.
+        if settings.openai_key_pool:
+            async for chunk in self._stream_openai_compatible(
+                prompt=prompt,
+                profile_model_name=settings.openai_model if model.startswith("openai_") else model,
+                profile_base_url=settings.openai_base_url,
+                api_key=self._pick_from_pool(settings.openai_key_pool, "OPENAI_API_KEYS"),
+            ):
                 yield chunk
             return
 
@@ -43,15 +69,21 @@ class LLMProvider:
             reasoning="route_decision -> provider_generate",
         )
 
-    async def _stream_openai_compatible(self, prompt: str, model: str) -> AsyncIterator[str]:
-        base_url = settings.openai_base_url.rstrip("/") if settings.openai_base_url else "https://api.openai.com/v1"
+    async def _stream_openai_compatible(
+        self,
+        prompt: str,
+        profile_model_name: str,
+        profile_base_url: str,
+        api_key: str,
+    ) -> AsyncIterator[str]:
+        base_url = profile_base_url.rstrip("/") if profile_base_url else "https://api.openai.com/v1"
         endpoint = f"{base_url}/chat/completions"
         headers = {
-            "Authorization": f"Bearer {settings.openai_api_key}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
         payload = {
-            "model": settings.openai_model if model in {"small-fast", "strong-reasoning", "long-context", "tool-use"} else model,
+            "model": profile_model_name,
             "messages": [{"role": "user", "content": prompt}],
             "stream": True,
         }
@@ -76,6 +108,25 @@ class LLMProvider:
                     content = delta.get("content")
                     if content:
                         yield content
+
+    def _pick_api_key(self, env_name: str) -> str:
+        raw = os.getenv(env_name, "").strip()
+        if not raw and env_name == "OPENAI_API_KEY":
+            # Backward compatibility with OPENAI_API_KEYS from settings.
+            return self._pick_from_pool(settings.openai_key_pool, env_name)
+        if not raw:
+            return ""
+        pool = [part.strip() for part in raw.split(",") if part.strip()]
+        return self._pick_from_pool(pool, env_name)
+
+    def _pick_from_pool(self, pool: list[str], pool_name: str) -> str:
+        if not pool:
+            return ""
+        with self._rr_lock:
+            idx = self._rr_index_by_pool.get(pool_name, 0)
+            chosen = pool[idx % len(pool)]
+            self._rr_index_by_pool[pool_name] = (idx + 1) % len(pool)
+        return chosen
 
     @staticmethod
     def _chunk_text(text: str, chunk_size: int = 64) -> list[str]:

@@ -6,6 +6,7 @@ from time import monotonic
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import Message
+from aiogram.types import MessageDeleted
 
 from src.bot.keyboards import control_keyboard, model_selection_keyboard
 from src.bot.runtime import generation_control, model_router, provider, session_manager
@@ -43,6 +44,14 @@ async def on_stop(message: Message) -> None:
     await message.answer("Stop requested for current topic generation.")
 
 
+@router.message(Command("models"))
+async def on_models(message: Message) -> None:
+    lines = ["Available models:"]
+    for model in settings.model_catalog:
+        lines.append(f"- {model.id}: {model.label} ({model.model_name})")
+    await message.answer("\n".join(lines))
+
+
 @router.message(F.text)
 async def on_text(message: Message) -> None:
     if message.message_thread_id is None:
@@ -66,7 +75,7 @@ async def on_text(message: Message) -> None:
     requested_mode = selected_model if mode == "manual" and selected_model else settings.default_model_mode
     route = model_router.route(incoming_text, mode=requested_mode)
 
-    header = f"Model: {route.model}\nReason: {route.reason}\n\n"
+    header = f"ModelId: {route.model}\nReason: {route.reason}\n\n"
     sent = await message.answer(header + "...", reply_markup=control_keyboard())
     generation_control.begin(topic_key.value)
 
@@ -115,3 +124,17 @@ async def on_text(message: Message) -> None:
             partial_reasoning=reasoning,
             stop_reason=stop_reason,
         )
+
+
+@router.deleted_business_messages()
+async def on_deleted_business_messages(event: MessageDeleted) -> None:
+    # This update type is for business mode; kept for compatibility.
+    if event.chat is None or event.message_ids is None:
+        return
+    thread_id = event.message_thread_id if event.message_thread_id is not None else 0
+    key = TopicKey(chat_id=event.chat.id, message_thread_id=thread_id)
+    changed = 0
+    for message_id in event.message_ids:
+        if session_manager.mark_deleted(key, message_id):
+            changed += 1
+    logger.info("Deleted sync applied chat=%s thread=%s changed=%s", event.chat.id, thread_id, changed)

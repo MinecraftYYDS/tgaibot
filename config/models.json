@@ -1,0 +1,40 @@
+{
+  "models": [
+    {
+      "id": "openai_fast",
+      "label": "OpenAI Fast",
+      "provider": "openai_compatible",
+      "model_name": "gpt-4o-mini",
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "tags": ["simple"]
+    },
+    {
+      "id": "openai_strong",
+      "label": "OpenAI Strong",
+      "provider": "openai_compatible",
+      "model_name": "gpt-4.1",
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "tags": ["reasoning"]
+    },
+    {
+      "id": "openai_long",
+      "label": "OpenAI Long Context",
+      "provider": "openai_compatible",
+      "model_name": "gpt-4.1",
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "tags": ["long"]
+    },
+    {
+      "id": "openai_tool",
+      "label": "OpenAI Tool",
+      "provider": "openai_compatible",
+      "model_name": "gpt-4.1",
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "tags": ["tool"]
+    }
+  ]
+}
