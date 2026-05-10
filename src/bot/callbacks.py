@@ -47,12 +47,6 @@ async def on_summarize(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(lambda c: c.data and c.data == "control:clear")
-async def on_clear(callback: CallbackQuery) -> None:
-    if callback.message and callback.message.message_thread_id is not None:
-        key = TopicKey(chat_id=callback.message.chat.id, message_thread_id=callback.message.message_thread_id)
-        changed = session_manager.clear_topic_messages(key)
-        await callback.answer(f"🗑️ 已清除: {changed} 条消息")
-        if callback.message:
-            await callback.message.answer(f"📭 上下文已清除: {changed} 条消息")
-        return
-    await callback.answer("❌ 无话题上下文")
+async def on_clear_removed(callback: CallbackQuery) -> None:
+    await callback.answer("该功能已移除", show_alert=False)
+

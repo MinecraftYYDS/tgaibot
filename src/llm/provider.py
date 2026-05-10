@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 from collections.abc import Awaitable, Callable
 from collections.abc import AsyncIterator
@@ -13,6 +15,8 @@ from src.config import settings
 from src.model_catalog import resolve_model
 from src.llm.tools import execute_builtin_tool, try_extract_tool_intent
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class GenerationResult:
@@ -24,6 +28,7 @@ class LLMProvider:
     def __init__(self) -> None:
         self._rr_lock = Lock()
         self._rr_index_by_pool: dict[str, int] = {}
+        self._last_reasoning_content: str = ""
 
     async def stream_generate(
         self,
@@ -102,7 +107,12 @@ class LLMProvider:
                 role = str(msg.get("role") or "").strip()
                 content = str(msg.get("content") or "").strip()
                 if role in {"user", "assistant"} and content:
-                    messages.append({"role": role, "content": content})
+                    packed: dict[str, object] = {"role": role, "content": content}
+                    if role == "assistant":
+                        reasoning_content = str(msg.get("reasoning_content") or "").strip()
+                        if reasoning_content:
+                            packed["reasoning_content"] = reasoning_content
+                    messages.append(packed)
         messages.append({"role": "user", "content": prompt})
 
         tools = [
@@ -143,7 +153,8 @@ class LLMProvider:
             },
         ]
 
-        for _ in range(max_iterations):
+        for iteration in range(max_iterations):
+            logger.debug(f"[agentic-loop] iteration {iteration+1}/{max_iterations}")
             obj = await self._chat_openai_compatible(
                 profile_model_name=profile_model_name,
                 profile_base_url=profile_base_url,
@@ -158,22 +169,33 @@ class LLMProvider:
                 return ""
             assistant = choices[0].get("message") or {}
             assistant_content = assistant.get("content") or ""
+            assistant_reasoning = str(assistant.get("reasoning_content") or "").strip()
             tool_calls = assistant.get("tool_calls") or []
+            logger.debug(f"[model-response] tool_calls count={len(tool_calls)} content_len={len(assistant_content)}")
+            logger.debug(f"[assistant-msg-keys] {assistant.keys()}")
+            if tool_calls:
+                logger.debug(f"[tool-calls-raw] {tool_calls}")
+            logger.debug(f"[model-content] {repr(assistant_content[:200])}")
 
             assistant_msg: dict[str, object] = {
                 "role": "assistant",
                 "content": assistant_content,
             }
+            if assistant_reasoning:
+                assistant_msg["reasoning_content"] = assistant_reasoning
             if tool_calls:
                 assistant_msg["tool_calls"] = tool_calls
             messages.append(assistant_msg)
 
             if not tool_calls:
+                reasoning = assistant_reasoning
+                self._last_reasoning_content = reasoning
                 return str(assistant_content)
 
             for tool_call in tool_calls:
                 fn = (tool_call.get("function") or {}) if isinstance(tool_call, dict) else {}
                 name = str(fn.get("name") or "").strip()
+                logger.debug(f"[tool-call-extract] raw_name={repr(fn.get('name'))} → stripped={repr(name)}")
                 raw_args = str(fn.get("arguments") or "{}").strip()
                 try:
                     parsed_args = json.loads(raw_args) if raw_args else {}
@@ -192,13 +214,19 @@ class LLMProvider:
                 elif name == "time_now":
                     tool_name = "time_now"
                 else:
-                    tool_name = name
+                    tool_name = name if name else "unknown_tool"
 
+                logger.debug(f"[tool-execute] name={tool_name} argument={repr(argument[:50] if len(argument) > 50 else argument)}")
                 if on_tool_event is not None:
-                    await on_tool_event(f"start:{tool_name}")
+                    event_msg = f"start:{tool_name}"
+                    logger.debug(f"[tool-event-callback] sending={repr(event_msg)}")
+                    await on_tool_event(event_msg)
                 tool_result = await execute_builtin_tool(tool_name, argument)
+                logger.debug(f"[tool-result] {tool_name}={repr(tool_result[:100] if len(tool_result) > 100 else tool_result)}")
                 if on_tool_event is not None:
-                    await on_tool_event(f"done:{tool_name}")
+                    event_msg = f"done:{tool_name}"
+                    logger.debug(f"[tool-event-callback] sending={repr(event_msg)}")
+                    await on_tool_event(event_msg)
                 tool_call_id = str(tool_call.get("id") or "") if isinstance(tool_call, dict) else ""
                 messages.append(
                     {
@@ -226,8 +254,12 @@ class LLMProvider:
         )
         final_choices = final_obj.get("choices") or []
         if not final_choices:
+            self._last_reasoning_content = ""
             return ""
-        return str((final_choices[0].get("message") or {}).get("content") or "")
+        final_message = final_choices[0].get("message") or {}
+        reasoning = str(final_message.get("reasoning_content") or "").strip()
+        self._last_reasoning_content = reasoning
+        return str(final_message.get("content") or "")
 
     async def _chat_openai_compatible(
         self,
@@ -252,26 +284,69 @@ class LLMProvider:
         }
         if tools:
             payload["tools"] = tools
-        if tool_choice:
-            payload["tool_choice"] = tool_choice
+            logger.debug(f"[payload-tools] {json.dumps(tools, indent=2, ensure_ascii=False)}")
+        retryable_status_codes = {408, 409, 425, 429, 500, 502, 503, 504}
+        max_attempts = 3
 
         async with httpx.AsyncClient(timeout=settings.provider_timeout_seconds) as client:
-            response = await client.post(endpoint, headers=headers, json=payload)
-            if response.status_code >= 400:
-                error_text = response.text.strip()
-                parsed_detail = ""
+            logger.debug(f"[full-payload] {json.dumps(payload, indent=2, ensure_ascii=False)[:500]}")
+            for attempt in range(1, max_attempts + 1):
                 try:
-                    obj = json.loads(error_text)
-                    err = obj.get("error") if isinstance(obj, dict) else None
-                    if isinstance(err, dict):
-                        parsed_detail = str(err.get("message") or err.get("type") or "")
-                except json.JSONDecodeError:
+                    response = await client.post(endpoint, headers=headers, json=payload)
+                except (
+                    httpx.RemoteProtocolError,
+                    httpx.ReadError,
+                    httpx.ReadTimeout,
+                    httpx.ConnectError,
+                    httpx.ConnectTimeout,
+                    httpx.WriteError,
+                    httpx.PoolTimeout,
+                ) as exc:
+                    if attempt < max_attempts:
+                        wait_seconds = 0.6 * attempt
+                        logger.warning(
+                            "upstream transport error, retrying attempt=%s/%s model=%s error=%s",
+                            attempt,
+                            max_attempts,
+                            profile_model_name,
+                            type(exc).__name__,
+                        )
+                        await asyncio.sleep(wait_seconds)
+                        continue
+                    raise ValueError(
+                        f"上游连接异常（{type(exc).__name__}），模型={profile_model_name}，请稍后重试"
+                    ) from exc
+
+                if response.status_code in retryable_status_codes and attempt < max_attempts:
+                    wait_seconds = 0.6 * attempt
+                    logger.warning(
+                        "upstream transient status, retrying attempt=%s/%s model=%s status=%s",
+                        attempt,
+                        max_attempts,
+                        profile_model_name,
+                        response.status_code,
+                    )
+                    await asyncio.sleep(wait_seconds)
+                    continue
+
+                if response.status_code >= 400:
+                    error_text = response.text.strip()
                     parsed_detail = ""
-                detail = parsed_detail or error_text or "无错误详情"
-                raise ValueError(
-                    f"上游接口请求失败 HTTP {response.status_code}，模型={profile_model_name}，详情：{detail}"
-                )
-            return response.json()
+                    try:
+                        obj = json.loads(error_text)
+                        err = obj.get("error") if isinstance(obj, dict) else None
+                        if isinstance(err, dict):
+                            parsed_detail = str(err.get("message") or err.get("type") or "")
+                    except json.JSONDecodeError:
+                        parsed_detail = ""
+                    detail = parsed_detail or error_text or "无错误详情"
+                    raise ValueError(
+                        f"上游接口请求失败 HTTP {response.status_code}，模型={profile_model_name}，详情：{detail}"
+                    )
+
+                return response.json()
+
+        return {}
 
     def _pick_api_key(self, env_name: str) -> str:
         raw = os.getenv(env_name, "").strip()

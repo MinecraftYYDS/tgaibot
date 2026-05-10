@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     auto_reasoning_model_id: str = Field(default="openai_strong", alias="AUTO_REASONING_MODEL_ID")
     auto_long_model_id: str = Field(default="openai_long", alias="AUTO_LONG_MODEL_ID")
     auto_tool_model_id: str = Field(default="openai_tool", alias="AUTO_TOOL_MODEL_ID")
-    reasoning_mode: str = Field(default="visible_then_hide", alias="REASONING_MODE")
+    reasoning_mode: str = Field(default="disabled", alias="REASONING_MODE")
     stream_edit_interval_seconds: float = Field(default=0.8, alias="STREAM_EDIT_INTERVAL_SECONDS")
 
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")

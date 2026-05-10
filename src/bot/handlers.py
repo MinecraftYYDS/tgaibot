@@ -22,8 +22,18 @@ router = Router(name="handlers")
 async def _safe_edit_markdown(message: Message, text: str) -> None:
     try:
         await message.edit_text(text, reply_markup=control_keyboard(), parse_mode="Markdown")
-    except TelegramBadRequest:
-        await message.edit_text(text, reply_markup=control_keyboard())
+    except TelegramBadRequest as exc:
+        error_text = str(exc).lower()
+        if "message is not modified" in error_text:
+            return
+        if "parse entities" not in error_text:
+            raise
+        try:
+            await message.edit_text(text, reply_markup=control_keyboard())
+        except TelegramBadRequest as fallback_exc:
+            if "message is not modified" in str(fallback_exc).lower():
+                return
+            raise
 
 
 @router.message(Command("start"))
@@ -36,7 +46,7 @@ async def on_start(message: Message) -> None:
         "3️⃣ 可用 /search 关键词 进行联网搜索\n\n"
         "按钮说明：\n"
         "- 对话总结：提炼当前话题的结论、要点和待办\n"
-        "- 清空上下文：清除此话题历史记忆"
+        "- 停止生成：中断当前回复"
     )
 
 
@@ -144,17 +154,35 @@ async def on_text(message: Message) -> None:
     context_text = session_manager.collect_context_for_response(topic_key)
     generation_control.begin(topic_key.value)
 
+    tool_status = ""
+
+    def _current_stream_render() -> str:
+        parts: list[str] = [header]
+        if tool_status:
+            parts.append(tool_status + "\n\n")
+        parts.append(built_answer or "⏳ 思考中...")
+        return "".join(parts)
+
     async def _tool_event_to_chat(event: str) -> None:
+        nonlocal tool_status
         if event.startswith("start:"):
-            tool_name = event.split(":", maxsplit=1)[1]
+            tool_name = event.split(":", maxsplit=1)[1].strip()
             if tool_name == "search":
-                await message.answer("🛠️ AI 正在调用工具：联网搜索...")
+                tool_status = "🛠️ 正在调用工具：联网搜索..."
+            elif tool_name in {"", "undefined", "unknown_tool"}:
+                tool_status = "🛠️ 正在调用工具：未知工具"
             else:
-                await message.answer(f"🛠️ AI 正在调用工具：{tool_name}")
+                tool_status = f"🛠️ 正在调用工具：{tool_name}"
+            await _safe_edit_markdown(sent, _current_stream_render())
         elif event.startswith("done:"):
-            tool_name = event.split(":", maxsplit=1)[1]
+            tool_name = event.split(":", maxsplit=1)[1].strip()
             if tool_name == "search":
-                await message.answer("✅ 联网搜索完成，正在生成最终回答...")
+                tool_status = "✅ 联网搜索完成，正在生成最终回答..."
+            elif tool_name in {"", "undefined", "unknown_tool"}:
+                tool_status = "✅ 工具调用完成，正在生成最终回答..."
+            else:
+                tool_status = f"✅ 工具 {tool_name} 调用完成，正在生成最终回答..."
+            await _safe_edit_markdown(sent, _current_stream_render())
 
     last_edit = monotonic()
     built_answer = ""
@@ -172,12 +200,18 @@ async def on_text(message: Message) -> None:
             built_answer += chunk
             now = monotonic()
             if now - last_edit >= settings.stream_edit_interval_seconds:
-                await _safe_edit_markdown(sent, header + (built_answer or "⏳ 思考中..."))
+                await _safe_edit_markdown(sent, _current_stream_render())
                 last_edit = now
     except Exception as exc:  # noqa: BLE001
         err_text = str(exc)
         should_fallback = (
-            ("No available channel for model" in err_text or "HTTP 503" in err_text)
+            (
+                "No available channel for model" in err_text
+                or "HTTP 503" in err_text
+                or "RemoteProtocolError" in err_text
+                or "ReadTimeout" in err_text
+                or "上游连接异常" in err_text
+            )
             and settings.auto_simple_model_id
             and settings.auto_simple_model_id != route.model
         )
@@ -202,7 +236,7 @@ async def on_text(message: Message) -> None:
                     built_answer += chunk
                     now = monotonic()
                     if now - last_edit >= settings.stream_edit_interval_seconds:
-                        await _safe_edit_markdown(sent, header + (built_answer or "⏳ 思考中..."))
+                        await _safe_edit_markdown(sent, _current_stream_render())
                         last_edit = now
             except Exception as fallback_exc:  # noqa: BLE001
                 stop_reason = "error"
@@ -214,7 +248,8 @@ async def on_text(message: Message) -> None:
         generation_control.end(topic_key.value)
 
     reasoning_text = "route_decision -> stream_generate"
-    reasoning = post_process_reasoning(settings.reasoning_mode, reasoning_text)
+    reasoning_raw = provider._last_reasoning_content or reasoning_text
+    reasoning = post_process_reasoning(settings.reasoning_mode, reasoning_raw)
     final_text = built_answer or "(无响应)"
     if stop_reason == "user_stop":
         final_text += "\n\n⏹️ 已停止"
@@ -222,8 +257,6 @@ async def on_text(message: Message) -> None:
         final_text += "\n\n（含错误）"
 
     final_render = header + final_text
-    if reasoning:
-        final_render += "\n\n[推理摘要]\n" + reasoning
 
     await _safe_edit_markdown(sent, final_render)
     session_manager.append_message(
@@ -231,7 +264,7 @@ async def on_text(message: Message) -> None:
         telegram_message_id=sent.message_id,
         role="assistant",
         content=final_text,
-        reasoning=reasoning,
+        reasoning=reasoning_raw,
     )
     msg_count = session_manager.topic_message_count(topic_key)
     if msg_count == 2:

@@ -152,10 +152,13 @@ class TopicSessionManager:
             items = db.execute(stmt).scalars().all()
             messages: list[dict] = []
             for item in items:
-                messages.append({
+                msg = {
                     "role": "assistant" if item.role == "assistant" else "user",
                     "content": item.content,
-                })
+                }
+                if item.reasoning and item.reasoning.strip():
+                    msg["reasoning_content"] = item.reasoning
+                messages.append(msg)
             return messages
 
     def collect_context_for_summary(self, key: TopicKey, max_messages: int = 30) -> str:

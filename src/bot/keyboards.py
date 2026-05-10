@@ -19,6 +19,5 @@ def control_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="停止生成", callback_data="control:stop")],
             [InlineKeyboardButton(text="对话总结", callback_data="control:summarize")],
-            [InlineKeyboardButton(text="清空上下文", callback_data="control:clear")],
         ]
     )

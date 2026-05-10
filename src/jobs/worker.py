@@ -19,8 +19,13 @@ async def run_job_worker(bot: Bot) -> None:
                 await asyncio.sleep(1.0)
                 continue
             job_id, topic_id, job_type, payload = claimed
-            await _execute_job(bot=bot, job_id=job_id, topic_id=topic_id, job_type=job_type, payload=payload)
-            session_manager.finish_job(job_id)
+            try:
+                await _execute_job(bot=bot, job_id=job_id, topic_id=topic_id, job_type=job_type, payload=payload)
+            except Exception:  # noqa: BLE001
+                session_manager.fail_job(job_id)
+                raise
+            else:
+                session_manager.finish_job(job_id)
         except Exception:  # noqa: BLE001
             logger.exception("Job worker tick failed")
             await asyncio.sleep(1.0)
@@ -34,13 +39,31 @@ async def _execute_job(bot: Bot, job_id: int, topic_id: int, job_type: str, payl
     if job_type == "summarize":
         context = session_manager.collect_context_for_summary(key, max_messages=40)
         if not context.strip():
+            await bot.send_message(
+                chat_id=key.chat_id,
+                message_thread_id=key.message_thread_id,
+                text="🧾 当前话题还没有足够内容可总结。",
+            )
             return
         prompt = (
             "请将以下对话总结为 5 条以内要点，中文输出，保留关键结论和待办。\n\n"
             + context
         )
         result = await provider.generate(prompt=prompt, model=settings.auto_reasoning_model_id)
-        session_manager.set_topic_summary(key, result.final_text)
+        summary_text = result.final_text.strip()
+        session_manager.set_topic_summary(key, summary_text)
+        if summary_text:
+            await bot.send_message(
+                chat_id=key.chat_id,
+                message_thread_id=key.message_thread_id,
+                text=f"🧾 本话题总结：\n\n{summary_text}",
+            )
+        else:
+            await bot.send_message(
+                chat_id=key.chat_id,
+                message_thread_id=key.message_thread_id,
+                text="⚠️ 总结生成完成，但未返回可展示内容，请稍后重试。",
+            )
         return
 
     if job_type == "rename_topic":
