@@ -11,6 +11,7 @@ class Settings(BaseSettings):
 
     telegram_bot_token: str = Field(alias="TELEGRAM_BOT_TOKEN")
     telegram_allowed_chat_ids: str = Field(default="", alias="TELEGRAM_ALLOWED_CHAT_IDS")
+    telegram_allowed_user_ids: str = Field(default="", alias="TELEGRAM_ALLOWED_USER_IDS")
 
     db_path: str = Field(default="./data/tgaibot.db", alias="DB_PATH")
     model_config_path: str = Field(default="./config/models.json", alias="MODEL_CONFIG_PATH")
@@ -35,11 +36,11 @@ class Settings(BaseSettings):
     fastapi_host: str = Field(default="127.0.0.1", alias="FASTAPI_HOST")
     fastapi_port: int = Field(default=8011, alias="FASTAPI_PORT")
 
-    @property
-    def allowed_chat_ids(self) -> set[int]:
-        if not self.telegram_allowed_chat_ids.strip():
+    @staticmethod
+    def _parse_int_set(raw: str) -> set[int]:
+        if not raw.strip():
             return set()
-        parts = [p.strip() for p in self.telegram_allowed_chat_ids.split(",") if p.strip()]
+        parts = [part.strip() for part in raw.split(",") if part.strip()]
         values: set[int] = set()
         for part in parts:
             try:
@@ -47,6 +48,14 @@ class Settings(BaseSettings):
             except ValueError:
                 continue
         return values
+
+    @property
+    def allowed_chat_ids(self) -> set[int]:
+        return self._parse_int_set(self.telegram_allowed_chat_ids)
+
+    @property
+    def allowed_user_ids(self) -> set[int]:
+        return self._parse_int_set(self.telegram_allowed_user_ids)
 
     @property
     def openai_key_pool(self) -> list[str]:

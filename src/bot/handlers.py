@@ -136,7 +136,9 @@ async def on_text(message: Message) -> None:
     if message.message_thread_id is None or message.message_thread_id == 0:
         await message.answer("⚠️ 请在论坛话题内聊天")
         return
-    if settings.allowed_chat_ids and message.chat.id not in settings.allowed_chat_ids:
+    user_id = message.from_user.id if message.from_user else None
+    is_allowed_user = user_id in settings.allowed_user_ids if user_id is not None else False
+    if settings.allowed_chat_ids and message.chat.id not in settings.allowed_chat_ids and not is_allowed_user:
         await message.answer("❌ 此群组未被授权使用此机器人")
         return
 

@@ -77,6 +77,8 @@ Copy-Item .env.example .env
 至少需要配置：
 
 - TELEGRAM_BOT_TOKEN
+- TELEGRAM_ALLOWED_CHAT_IDS（可选，逗号分隔）
+- TELEGRAM_ALLOWED_USER_IDS（可选，逗号分隔；这些用户总是允许使用）
 
 建议配置（OpenAI 兼容）：
 
