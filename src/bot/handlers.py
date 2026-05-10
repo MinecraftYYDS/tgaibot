@@ -47,10 +47,10 @@ def _compact_query_for_status(query: str, max_len: int = 60) -> str:
 
 def _format_elapsed(seconds: float) -> str:
     total_seconds = max(0, int(seconds))
-    minutes, sec = divmod(total_seconds, 60)
+    minutes, remaining_seconds = divmod(total_seconds, 60)
     if minutes > 0:
-        return f"{minutes} m {sec} s"
-    return f"{sec} s"
+        return f"{minutes} m {remaining_seconds} s"
+    return f"{remaining_seconds} s"
 
 
 @router.message(Command("start"))
@@ -229,14 +229,17 @@ async def on_text(message: Message) -> None:
     last_edit = monotonic()
     built_answer = ""
     stop_reason = "completed"
-    keep_thinking_timer = True
+    thinking_timer_stop = asyncio.Event()
 
     async def _thinking_timer_loop() -> None:
-        while keep_thinking_timer:
+        while not thinking_timer_stop.is_set():
             if built_answer:
                 break
             await _safe_edit_markdown(sent, _current_stream_render())
-            await asyncio.sleep(1)
+            try:
+                await asyncio.wait_for(thinking_timer_stop.wait(), timeout=1)
+            except asyncio.TimeoutError:
+                continue
 
     thinking_timer_task = asyncio.create_task(_thinking_timer_loop())
     try:
@@ -298,9 +301,9 @@ async def on_text(message: Message) -> None:
             stop_reason = "error"
             built_answer += f"\n\n❌ 错误: {type(exc).__name__}: {exc}"
     finally:
-        keep_thinking_timer = False
+        thinking_timer_stop.set()
         thinking_timer_task.cancel()
-        with suppress(Exception):
+        with suppress(asyncio.CancelledError):
             await thinking_timer_task
         generation_control.end(topic_key.value)
 
