@@ -291,8 +291,6 @@ async def on_text(message: Message) -> None:
     msg_count = session_manager.topic_message_count(topic_key)
     if msg_count == 2:
         session_manager.enqueue_job(topic_key, job_type="rename_topic", payload={"source": "auto"})
-    if msg_count > 0 and msg_count % 10 == 0:
-        session_manager.enqueue_job(topic_key, job_type="summarize", payload={"source": "auto", "count": msg_count})
     if stop_reason != "completed":
         session_manager.save_streaming_checkpoint(
             key=topic_key,
