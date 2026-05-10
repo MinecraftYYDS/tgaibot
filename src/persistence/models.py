@@ -75,3 +75,15 @@ class Job(Base):
     status: Mapped[str] = mapped_column(String(20), default="pending")
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class StreamingCheckpoint(Base):
+    __tablename__ = "streaming_checkpoints"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    topic_id: Mapped[int] = mapped_column(ForeignKey("topics.id"), nullable=False, index=True)
+    assistant_telegram_message_id: Mapped[int] = mapped_column(Integer, default=0)
+    partial_content: Mapped[str] = mapped_column(Text, default="")
+    partial_reasoning: Mapped[str] = mapped_column(Text, default="")
+    stop_reason: Mapped[str] = mapped_column(String(50), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

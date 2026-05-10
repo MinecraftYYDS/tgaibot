@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from sqlalchemy import select
 
-from src.persistence.models import Message, Topic
+from src.persistence.models import Message, ModelState, StreamingCheckpoint, Topic
 from src.sync.consistency import topic_transaction
 
 
@@ -69,6 +69,47 @@ class TopicSessionManager:
             message.deleted = True
             db.add(message)
             return True
+
+    def get_topic_model_selection(self, key: TopicKey) -> tuple[str, str]:
+        with topic_transaction(key.value) as db:
+            topic = self._fetch_topic_for_update(db, key)
+            return topic.model_mode, topic.model_name
+
+    def set_topic_model_selection(self, key: TopicKey, mode: str, model_name: str, reason: str) -> None:
+        with topic_transaction(key.value) as db:
+            topic = self._fetch_topic_for_update(db, key)
+            prev = topic.model_name if topic.model_name else topic.model_mode
+            topic.model_mode = mode
+            topic.model_name = model_name
+            db.add(topic)
+            db.add(
+                ModelState(
+                    topic_id=topic.id,
+                    prev_model=prev,
+                    next_model=model_name if model_name else mode,
+                    reason=reason,
+                )
+            )
+
+    def save_streaming_checkpoint(
+        self,
+        key: TopicKey,
+        assistant_telegram_message_id: int,
+        partial_content: str,
+        partial_reasoning: str,
+        stop_reason: str,
+    ) -> None:
+        with topic_transaction(key.value) as db:
+            topic = self._fetch_topic_for_update(db, key)
+            db.add(
+                StreamingCheckpoint(
+                    topic_id=topic.id,
+                    assistant_telegram_message_id=assistant_telegram_message_id,
+                    partial_content=partial_content,
+                    partial_reasoning=partial_reasoning,
+                    stop_reason=stop_reason,
+                )
+            )
 
     @staticmethod
     def _fetch_topic_for_update(db, key: TopicKey) -> Topic:

@@ -1,23 +1,20 @@
 from __future__ import annotations
 
 import logging
+from time import monotonic
 
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
 from src.bot.keyboards import control_keyboard, model_selection_keyboard
+from src.bot.runtime import generation_control, model_router, provider, session_manager
 from src.config import settings
-from src.llm.provider import LLMProvider
 from src.llm.reasoning import post_process_reasoning
-from src.routing.router import ModelRouter
-from src.session.manager import TopicKey, TopicSessionManager
+from src.session.manager import TopicKey
 
 logger = logging.getLogger(__name__)
 router = Router(name="handlers")
-session_manager = TopicSessionManager()
-model_router = ModelRouter()
-provider = LLMProvider()
 
 
 @router.message(Command("start"))
@@ -38,6 +35,11 @@ async def on_new(message: Message) -> None:
 
 @router.message(Command("stop"))
 async def on_stop(message: Message) -> None:
+    if message.message_thread_id is None:
+        await message.answer("Please run /stop inside a forum topic.")
+        return
+    topic_key = TopicKey(chat_id=message.chat.id, message_thread_id=message.message_thread_id)
+    generation_control.stop(topic_key.value)
     await message.answer("Stop requested for current topic generation.")
 
 
@@ -60,24 +62,56 @@ async def on_text(message: Message) -> None:
         content=incoming_text,
     )
 
-    route = model_router.route(incoming_text, mode=settings.default_model_mode)
-    generated = await provider.generate(prompt=incoming_text, model=route.model)
-    reasoning = post_process_reasoning(settings.reasoning_mode, generated.reasoning)
+    mode, selected_model = session_manager.get_topic_model_selection(topic_key)
+    requested_mode = selected_model if mode == "manual" and selected_model else settings.default_model_mode
+    route = model_router.route(incoming_text, mode=requested_mode)
 
-    reply_parts = [
-        f"Model: {route.model}",
-        f"Reason: {route.reason}",
-        "",
-        generated.final_text,
-    ]
+    header = f"Model: {route.model}\nReason: {route.reason}\n\n"
+    sent = await message.answer(header + "...", reply_markup=control_keyboard())
+    generation_control.begin(topic_key.value)
+
+    last_edit = monotonic()
+    built_answer = ""
+    stop_reason = "completed"
+    try:
+        async for chunk in provider.stream_generate(prompt=incoming_text, model=route.model):
+            if generation_control.should_stop(topic_key.value):
+                stop_reason = "user_stop"
+                break
+            built_answer += chunk
+            now = monotonic()
+            if now - last_edit >= settings.stream_edit_interval_seconds:
+                await sent.edit_text(header + (built_answer or "..."), reply_markup=control_keyboard())
+                last_edit = now
+    except Exception as exc:  # noqa: BLE001
+        stop_reason = "error"
+        built_answer += f"\n\n[error] {type(exc).__name__}: {exc}"
+    finally:
+        generation_control.end(topic_key.value)
+
+    reasoning_text = "route_decision -> stream_generate"
+    reasoning = post_process_reasoning(settings.reasoning_mode, reasoning_text)
+    final_text = built_answer or "(empty response)"
+    if stop_reason == "user_stop":
+        final_text += "\n\n[stopped by user]"
+
+    final_render = header + final_text
     if reasoning:
-        reply_parts.extend(["", "[reasoning]", reasoning])
+        final_render += "\n\n[reasoning]\n" + reasoning
 
-    sent = await message.answer("\n".join(reply_parts), reply_markup=control_keyboard())
+    await sent.edit_text(final_render, reply_markup=control_keyboard())
     session_manager.append_message(
         key=topic_key,
         telegram_message_id=sent.message_id,
         role="assistant",
-        content=generated.final_text,
+        content=final_text,
         reasoning=reasoning,
     )
+    if stop_reason != "completed":
+        session_manager.save_streaming_checkpoint(
+            key=topic_key,
+            assistant_telegram_message_id=sent.message_id,
+            partial_content=final_text,
+            partial_reasoning=reasoning,
+            stop_reason=stop_reason,
+        )
