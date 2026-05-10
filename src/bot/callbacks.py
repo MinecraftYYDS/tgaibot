@@ -46,7 +46,17 @@ async def on_summarize(callback: CallbackQuery) -> None:
     await callback.answer("❌ 无话题上下文")
 
 
+@router.callback_query(lambda c: c.data and c.data == "control:rename_topic")
+async def on_rename_topic(callback: CallbackQuery) -> None:
+    if callback.message and callback.message.message_thread_id is not None:
+        key = TopicKey(chat_id=callback.message.chat.id, message_thread_id=callback.message.message_thread_id)
+        session_manager.enqueue_job(key=key, job_type="rename_topic", payload={"source": "button"})
+        await callback.answer("📝 已开始生成话题标题")
+        await callback.message.answer("🏷️ 正在根据当前话题内容生成新标题。")
+        return
+    await callback.answer("❌ 无话题上下文")
+
+
 @router.callback_query(lambda c: c.data and c.data == "control:clear")
 async def on_clear_removed(callback: CallbackQuery) -> None:
     await callback.answer("该功能已移除", show_alert=False)
-
