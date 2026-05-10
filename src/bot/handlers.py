@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from time import monotonic
 
@@ -41,6 +42,14 @@ def _compact_query_for_status(query: str, max_len: int = 60) -> str:
     if len(compact) <= max_len:
         return compact
     return compact[: max_len - 1] + "…"
+
+
+def _format_elapsed(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    minutes, remaining_seconds = divmod(total_seconds, 60)
+    if minutes > 0:
+        return f"{minutes} m {remaining_seconds} s"
+    return f"{remaining_seconds} s"
 
 
 @router.message(Command("start"))
@@ -158,32 +167,42 @@ async def on_text(message: Message) -> None:
 
     prompt_for_model = incoming_text
 
+    started_at = monotonic()
     header = f"🤖 模型: {route.model}\n📋 原因: {route.reason}\n\n"
     try:
-        sent = await message.answer(header + "⏳ 思考中...", reply_markup=control_keyboard(), parse_mode="Markdown")
+        sent = await message.answer(
+            header + f"⏳ 思考中... {_format_elapsed(monotonic() - started_at)}",
+            reply_markup=control_keyboard(),
+            parse_mode="Markdown",
+        )
     except TelegramBadRequest:
-        sent = await message.answer(header + "⏳ 思考中...", reply_markup=control_keyboard())
+        sent = await message.answer(
+            header + f"⏳ 思考中... {_format_elapsed(monotonic() - started_at)}",
+            reply_markup=control_keyboard(),
+        )
 
     context_text = session_manager.collect_context_for_response(topic_key)
     generation_control.begin(topic_key.value)
 
     tool_status = ""
+    tool_call_count = 0
 
     def _current_stream_render() -> str:
         parts: list[str] = [header]
         if tool_status:
             parts.append(tool_status + "\n\n")
-        parts.append(built_answer or "⏳ 思考中...")
+        parts.append(built_answer or f"⏳ 思考中... {_format_elapsed(monotonic() - started_at)}")
         return "".join(parts)
 
     async def _tool_event_to_chat(event: str) -> None:
-        nonlocal tool_status
+        nonlocal tool_status, tool_call_count
         parts = event.split(":", maxsplit=2)
         action = parts[0] if parts else ""
         tool_name = parts[1].strip() if len(parts) > 1 else ""
         tool_query = parts[2].strip() if len(parts) > 2 else ""
         display_query = _compact_query_for_status(tool_query) if tool_query else ""
         if action == "start":
+            tool_call_count += 1
             if tool_name == "search":
                 if display_query:
                     tool_status = f"🛠️ 正在联网搜索：{display_query}"
@@ -209,6 +228,21 @@ async def on_text(message: Message) -> None:
     last_edit = monotonic()
     built_answer = ""
     stop_reason = "completed"
+    thinking_timer_stop = asyncio.Event()
+
+    async def _thinking_timer_loop() -> None:
+        while not thinking_timer_stop.is_set():
+            if built_answer:
+                break
+            try:
+                await asyncio.wait_for(thinking_timer_stop.wait(), timeout=1)
+            except asyncio.TimeoutError:
+                pass
+            if thinking_timer_stop.is_set() or built_answer:
+                break
+            await _safe_edit_markdown(sent, _current_stream_render())
+
+    thinking_timer_task = asyncio.create_task(_thinking_timer_loop())
     try:
         async for chunk in provider.stream_generate(
             prompt=prompt_for_model,
@@ -251,6 +285,7 @@ async def on_text(message: Message) -> None:
                     prompt=prompt_for_model,
                     model=fallback_model,
                     context_messages=context_text,
+                    on_tool_event=_tool_event_to_chat,
                 ):
                     if generation_control.should_stop(topic_key.value):
                         stop_reason = "user_stop"
@@ -267,6 +302,8 @@ async def on_text(message: Message) -> None:
             stop_reason = "error"
             built_answer += f"\n\n❌ 错误: {type(exc).__name__}: {exc}"
     finally:
+        thinking_timer_stop.set()
+        await thinking_timer_task
         generation_control.end(topic_key.value)
 
     reasoning_text = "route_decision -> stream_generate"
@@ -278,7 +315,9 @@ async def on_text(message: Message) -> None:
     elif stop_reason == "error":
         final_text += "\n\n（含错误）"
 
-    final_render = header + final_text
+    total_elapsed = _format_elapsed(monotonic() - started_at)
+    stats_text = f"\n\n⌛️ 用时：{total_elapsed}\n⚒️ 调用工具：{tool_call_count} 次"
+    final_render = header + final_text + stats_text
 
     await _safe_edit_markdown(sent, final_render)
     session_manager.append_message(
