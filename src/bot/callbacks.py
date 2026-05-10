@@ -50,7 +50,12 @@ async def on_summarize(callback: CallbackQuery) -> None:
 async def on_rename_topic(callback: CallbackQuery) -> None:
     if callback.message and callback.message.message_thread_id is not None:
         key = TopicKey(chat_id=callback.message.chat.id, message_thread_id=callback.message.message_thread_id)
-        session_manager.enqueue_job(key=key, job_type="rename_topic", payload={"source": "button"})
+        try:
+            session_manager.enqueue_job(key=key, job_type="rename_topic", payload={"source": "button"})
+        except Exception:  # noqa: BLE001
+            logger.exception("enqueue rename_topic failed chat=%s thread=%s", key.chat_id, key.message_thread_id)
+            await callback.answer("❌ 标题生成任务提交失败，请稍后重试")
+            return
         await callback.answer("📝 已开始生成话题标题")
         await callback.message.answer("🏷️ 正在根据当前话题内容生成新标题。")
         return
