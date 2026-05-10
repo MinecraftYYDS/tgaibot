@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     openai_base_url: str = Field(default="https://api.openai.com/v1", alias="OPENAI_BASE_URL")
     openai_model: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL")
     provider_timeout_seconds: float = Field(default=60.0, alias="PROVIDER_TIMEOUT_SECONDS")
+    search_proxy: str = Field(default="", alias="SEARCH_PROXY")
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
     google_api_key: str = Field(default="", alias="GOOGLE_API_KEY")
 

@@ -140,6 +140,24 @@ class TopicSessionManager:
             topic.summary = summary
             db.add(topic)
 
+    def collect_context_for_response(self, key: TopicKey) -> list[dict]:
+        """Collect ALL conversation history for LLM context (complete topic session)."""
+        with topic_transaction(key.value) as db:
+            topic = self._fetch_topic_for_update(db, key)
+            stmt = (
+                select(Message)
+                .where(Message.topic_id == topic.id, Message.deleted.is_(False))
+                .order_by(asc(Message.id))
+            )
+            items = db.execute(stmt).scalars().all()
+            messages: list[dict] = []
+            for item in items:
+                messages.append({
+                    "role": "assistant" if item.role == "assistant" else "user",
+                    "content": item.content,
+                })
+            return messages
+
     def collect_context_for_summary(self, key: TopicKey, max_messages: int = 30) -> str:
         with topic_transaction(key.value) as db:
             topic = self._fetch_topic_for_update(db, key)

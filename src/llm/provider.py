@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Awaitable, Callable
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from threading import Lock
@@ -24,7 +25,13 @@ class LLMProvider:
         self._rr_lock = Lock()
         self._rr_index_by_pool: dict[str, int] = {}
 
-    async def stream_generate(self, prompt: str, model: str) -> AsyncIterator[str]:
+    async def stream_generate(
+        self,
+        prompt: str,
+        model: str,
+        context_messages: list[dict] | None = None,
+        on_tool_event: Callable[[str], Awaitable[None]] | None = None,
+    ) -> AsyncIterator[str]:
         tool_intent = try_extract_tool_intent(prompt)
         if tool_intent is not None:
             tool_name, argument = tool_intent
@@ -35,25 +42,33 @@ class LLMProvider:
 
         profile = resolve_model(settings.model_catalog, model)
         if profile is not None and profile.provider == "openai_compatible":
+            if "tts" in profile.tags:
+                raise ValueError(f"模型 {profile.id} 属于 TTS 语音模型，不能用于文本聊天。请切换到对话模型。")
             api_key = self._pick_api_key(profile.api_key_env)
             if api_key:
-                async for chunk in self._stream_openai_compatible(
+                final_text = await self._generate_with_tool_calls(
                     prompt=prompt,
                     profile_model_name=profile.model_name,
                     profile_base_url=profile.base_url,
                     api_key=api_key,
-                ):
+                    context_messages=context_messages or [],
+                    on_tool_event=on_tool_event,
+                )
+                for chunk in self._chunk_text(final_text):
                     yield chunk
                 return
 
         # Compatibility path when old model IDs are passed directly.
         if settings.openai_key_pool:
-            async for chunk in self._stream_openai_compatible(
+            final_text = await self._generate_with_tool_calls(
                 prompt=prompt,
                 profile_model_name=settings.openai_model if model.startswith("openai_") else model,
                 profile_base_url=settings.openai_base_url,
                 api_key=self._pick_from_pool(settings.openai_key_pool, "OPENAI_API_KEYS"),
-            ):
+                context_messages=context_messages or [],
+                on_tool_event=on_tool_event,
+            )
+            for chunk in self._chunk_text(final_text):
                 yield chunk
             return
 
@@ -69,13 +84,161 @@ class LLMProvider:
             reasoning="route_decision -> provider_generate",
         )
 
-    async def _stream_openai_compatible(
+    async def _generate_with_tool_calls(
         self,
         prompt: str,
         profile_model_name: str,
         profile_base_url: str,
         api_key: str,
-    ) -> AsyncIterator[str]:
+        context_messages: list[dict] | None = None,
+        max_iterations: int = 5,
+        on_tool_event: Callable[[str], Awaitable[None]] | None = None,
+    ) -> str:
+        messages: list[dict] = [
+            {"role": "system", "content": "你是一个有帮助的AI助手。请用中文回答用户的问题。尽可能简洁、准确、有用。"},
+        ]
+        if context_messages:
+            for msg in context_messages:
+                role = str(msg.get("role") or "").strip()
+                content = str(msg.get("content") or "").strip()
+                if role in {"user", "assistant"} and content:
+                    messages.append({"role": role, "content": content})
+        messages.append({"role": "user", "content": prompt})
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "description": "联网搜索最新信息并返回摘要。适合实时资讯、新闻、需要来源链接的问题。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "搜索关键词"},
+                            "max_results": {"type": "integer", "description": "结果条数，1-10", "default": 5},
+                        },
+                        "required": ["query"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "time_now",
+                    "description": "获取当前 UTC 时间。",
+                    "parameters": {"type": "object", "properties": {}, "required": []},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "echo",
+                    "description": "原样返回输入内容，用于调试。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"text": {"type": "string", "description": "要回显的文本"}},
+                        "required": ["text"],
+                    },
+                },
+            },
+        ]
+
+        for _ in range(max_iterations):
+            obj = await self._chat_openai_compatible(
+                profile_model_name=profile_model_name,
+                profile_base_url=profile_base_url,
+                api_key=api_key,
+                messages=messages,
+                stream=False,
+                tools=tools,
+                tool_choice="auto",
+            )
+            choices = obj.get("choices") or []
+            if not choices:
+                return ""
+            assistant = choices[0].get("message") or {}
+            assistant_content = assistant.get("content") or ""
+            tool_calls = assistant.get("tool_calls") or []
+
+            assistant_msg: dict[str, object] = {
+                "role": "assistant",
+                "content": assistant_content,
+            }
+            if tool_calls:
+                assistant_msg["tool_calls"] = tool_calls
+            messages.append(assistant_msg)
+
+            if not tool_calls:
+                return str(assistant_content)
+
+            for tool_call in tool_calls:
+                fn = (tool_call.get("function") or {}) if isinstance(tool_call, dict) else {}
+                name = str(fn.get("name") or "").strip()
+                raw_args = str(fn.get("arguments") or "{}").strip()
+                try:
+                    parsed_args = json.loads(raw_args) if raw_args else {}
+                except json.JSONDecodeError:
+                    parsed_args = {}
+
+                argument = ""
+                if name in {"search", "web_search"}:
+                    query = str(parsed_args.get("query") or "").strip()
+                    max_results = int(parsed_args.get("max_results") or 5)
+                    argument = f"{query} | {max_results}"
+                    tool_name = "search"
+                elif name == "echo":
+                    argument = str(parsed_args.get("text") or "")
+                    tool_name = "echo"
+                elif name == "time_now":
+                    tool_name = "time_now"
+                else:
+                    tool_name = name
+
+                if on_tool_event is not None:
+                    await on_tool_event(f"start:{tool_name}")
+                tool_result = await execute_builtin_tool(tool_name, argument)
+                if on_tool_event is not None:
+                    await on_tool_event(f"done:{tool_name}")
+                tool_call_id = str(tool_call.get("id") or "") if isinstance(tool_call, dict) else ""
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": tool_result,
+                    }
+                )
+
+        # 达到工具循环上限后，强制要求模型基于已拿到信息作答。
+        messages.append(
+            {
+                "role": "user",
+                "content": "已达到工具调用上限，请不要再调用工具，直接基于当前信息给出最终答案。",
+            }
+        )
+        final_obj = await self._chat_openai_compatible(
+            profile_model_name=profile_model_name,
+            profile_base_url=profile_base_url,
+            api_key=api_key,
+            messages=messages,
+            stream=False,
+            tools=None,
+            tool_choice=None,
+        )
+        final_choices = final_obj.get("choices") or []
+        if not final_choices:
+            return ""
+        return str((final_choices[0].get("message") or {}).get("content") or "")
+
+    async def _chat_openai_compatible(
+        self,
+        profile_model_name: str,
+        profile_base_url: str,
+        api_key: str,
+        messages: list[dict],
+        stream: bool,
+        tools: list[dict] | None,
+        tool_choice: str | None,
+    ) -> dict:
         base_url = profile_base_url.rstrip("/") if profile_base_url else "https://api.openai.com/v1"
         endpoint = f"{base_url}/chat/completions"
         headers = {
@@ -84,30 +247,31 @@ class LLMProvider:
         }
         payload = {
             "model": profile_model_name,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": True,
+            "messages": messages,
+            "stream": stream,
         }
+        if tools:
+            payload["tools"] = tools
+        if tool_choice:
+            payload["tool_choice"] = tool_choice
 
         async with httpx.AsyncClient(timeout=settings.provider_timeout_seconds) as client:
-            async with client.stream("POST", endpoint, headers=headers, json=payload) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        obj = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
-                    choices = obj.get("choices") or []
-                    if not choices:
-                        continue
-                    delta = choices[0].get("delta") or {}
-                    content = delta.get("content")
-                    if content:
-                        yield content
+            response = await client.post(endpoint, headers=headers, json=payload)
+            if response.status_code >= 400:
+                error_text = response.text.strip()
+                parsed_detail = ""
+                try:
+                    obj = json.loads(error_text)
+                    err = obj.get("error") if isinstance(obj, dict) else None
+                    if isinstance(err, dict):
+                        parsed_detail = str(err.get("message") or err.get("type") or "")
+                except json.JSONDecodeError:
+                    parsed_detail = ""
+                detail = parsed_detail or error_text or "无错误详情"
+                raise ValueError(
+                    f"上游接口请求失败 HTTP {response.status_code}，模型={profile_model_name}，详情：{detail}"
+                )
+            return response.json()
 
     def _pick_api_key(self, env_name: str) -> str:
         raw = os.getenv(env_name, "").strip()

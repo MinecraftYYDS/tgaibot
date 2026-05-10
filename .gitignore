@@ -9,3 +9,5 @@ data/
 .pytest_cache/
 .mypy_cache/
 .vscode/
+
+models1.json

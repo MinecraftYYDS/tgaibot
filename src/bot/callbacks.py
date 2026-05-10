@@ -22,9 +22,9 @@ async def on_model_switch(callback: CallbackQuery) -> None:
             session_manager.set_topic_model_selection(key, mode="auto", model_name="", reason="user_button")
         else:
             session_manager.set_topic_model_selection(key, mode="manual", model_name=selected, reason="user_button")
-    await callback.answer(f"Model switched to {selected}")
+    await callback.answer(f"✅ 已切换模型: {selected}")
     if callback.message:
-        await callback.message.answer(f"Model set: {selected}", reply_markup=control_keyboard())
+        await callback.message.answer(f"📝 模型已设置: {selected}", reply_markup=control_keyboard())
 
 
 @router.callback_query(lambda c: c.data and c.data == "control:stop")
@@ -32,7 +32,7 @@ async def on_stop(callback: CallbackQuery) -> None:
     if callback.message and callback.message.message_thread_id is not None:
         key = TopicKey(chat_id=callback.message.chat.id, message_thread_id=callback.message.message_thread_id)
         generation_control.stop(key.value)
-    await callback.answer("Generation stop requested")
+    await callback.answer("⏹️ 已请求停止生成")
 
 
 @router.callback_query(lambda c: c.data and c.data == "control:summarize")
@@ -40,9 +40,10 @@ async def on_summarize(callback: CallbackQuery) -> None:
     if callback.message and callback.message.message_thread_id is not None:
         key = TopicKey(chat_id=callback.message.chat.id, message_thread_id=callback.message.message_thread_id)
         session_manager.enqueue_job(key=key, job_type="summarize", payload={"source": "button"})
-        await callback.answer("Summary job queued")
+        await callback.answer("📝 已开始生成本话题总结")
+        await callback.message.answer("🧾 正在整理本话题的关键信息：结论、要点与待办事项。")
         return
-    await callback.answer("No topic context")
+    await callback.answer("❌ 无话题上下文")
 
 
 @router.callback_query(lambda c: c.data and c.data == "control:clear")
@@ -50,8 +51,8 @@ async def on_clear(callback: CallbackQuery) -> None:
     if callback.message and callback.message.message_thread_id is not None:
         key = TopicKey(chat_id=callback.message.chat.id, message_thread_id=callback.message.message_thread_id)
         changed = session_manager.clear_topic_messages(key)
-        await callback.answer(f"Context cleared: {changed} messages")
+        await callback.answer(f"🗑️ 已清除: {changed} 条消息")
         if callback.message:
-            await callback.message.answer(f"Cleared context: {changed} messages")
+            await callback.message.answer(f"📭 上下文已清除: {changed} 条消息")
         return
-    await callback.answer("No topic context")
+    await callback.answer("❌ 无话题上下文")

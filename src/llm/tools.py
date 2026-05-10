@@ -3,6 +3,8 @@ from __future__ import annotations
 from asyncio import to_thread
 from datetime import datetime
 
+from src.config import settings
+
 
 def _parse_search_argument(argument: str) -> tuple[str, int]:
     # Format: "query" or "query | 5"
@@ -20,8 +22,18 @@ def _parse_search_argument(argument: str) -> tuple[str, int]:
 def _run_ddgs_text_search(query: str, max_results: int) -> list[dict[str, object]]:
     from ddgs import DDGS
 
-    with DDGS(timeout=10) as client:
-        results = client.text(query, max_results=max_results, region="us-en", safesearch="moderate")
+    proxy = settings.search_proxy.strip()
+    try:
+        if proxy:
+            with DDGS(timeout=10, proxy=proxy) as client:
+                results = client.text(query, max_results=max_results, region="us-en", safesearch="moderate")
+        else:
+            with DDGS(timeout=10) as client:
+                results = client.text(query, max_results=max_results, region="us-en", safesearch="moderate")
+    except TypeError:
+        # Compatibility for DDGS versions that don't accept proxy parameter.
+        with DDGS(timeout=10) as client:
+            results = client.text(query, max_results=max_results, region="us-en", safesearch="moderate")
     return results
 
 
