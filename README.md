@@ -172,8 +172,16 @@ python -m src.main
 
 - [tool:echo] 任意文本
 - [tool:time_now]
+- [tool:web_search] 关键词
+- [tool:search] 关键词 | 5
 
 后续可升级为完整 function-calling schema/tool-loop。
+
+说明：
+
+- web_search/search 使用项目根目录下的本地 ddgs 包
+- 结果会返回标题、链接和摘要
+- max_results 范围为 1-10，默认 5
 
 ### 11. 常见问题
 
@@ -262,4 +270,5 @@ Each model defines:
 
 - Bot and API run in the same process
 - Worker runs with bot polling
+- Search tool is backed by local ddgs package in project root
 - For production scale, consider PostgreSQL + Redis lock layer

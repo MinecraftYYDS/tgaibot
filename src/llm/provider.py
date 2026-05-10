@@ -28,7 +28,7 @@ class LLMProvider:
         tool_intent = try_extract_tool_intent(prompt)
         if tool_intent is not None:
             tool_name, argument = tool_intent
-            tool_output = execute_builtin_tool(tool_name, argument)
+            tool_output = await execute_builtin_tool(tool_name, argument)
             for chunk in self._chunk_text(f"Tool {tool_name} result: {tool_output}"):
                 yield chunk
             return
