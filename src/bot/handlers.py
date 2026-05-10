@@ -36,6 +36,13 @@ async def _safe_edit_markdown(message: Message, text: str) -> None:
             raise
 
 
+def _compact_query_for_status(query: str, max_len: int = 60) -> str:
+    compact = " ".join(query.split())
+    if len(compact) <= max_len:
+        return compact
+    return compact[: max_len - 1] + "…"
+
+
 @router.message(Command("start"))
 async def on_start(message: Message) -> None:
     await message.answer(
@@ -115,9 +122,13 @@ async def on_search(message: Message) -> None:
     if not query:
         await message.answer("🔎 用法：/search 关键词 或 /search 关键词 | 结果数(1-10)")
         return
-    await message.answer("🔎 正在搜索，请稍候...")
+    display_query = _compact_query_for_status(query)
+    await message.answer(f"🔎 正在联网搜索：{display_query}")
     result = await execute_builtin_tool("search", query)
-    await message.answer(f"🔎 搜索结果：\n\n{result}")
+    if result.startswith("tool_error:"):
+        await message.answer(f"❌ 联网搜索失败：{result}")
+        return
+    await message.answer(f"✅ 联网搜索完成：{display_query}")
 
 
 @router.message(F.text)
@@ -165,19 +176,28 @@ async def on_text(message: Message) -> None:
 
     async def _tool_event_to_chat(event: str) -> None:
         nonlocal tool_status
-        if event.startswith("start:"):
-            tool_name = event.split(":", maxsplit=1)[1].strip()
+        parts = event.split(":", maxsplit=2)
+        action = parts[0] if parts else ""
+        tool_name = parts[1].strip() if len(parts) > 1 else ""
+        tool_query = parts[2].strip() if len(parts) > 2 else ""
+        display_query = _compact_query_for_status(tool_query) if tool_query else ""
+        if action == "start":
             if tool_name == "search":
-                tool_status = "🛠️ 正在调用工具：联网搜索..."
+                if display_query:
+                    tool_status = f"🛠️ 正在联网搜索：{display_query}"
+                else:
+                    tool_status = "🛠️ 正在调用工具：联网搜索..."
             elif tool_name in {"", "undefined", "unknown_tool"}:
                 tool_status = "🛠️ 正在调用工具：未知工具"
             else:
                 tool_status = f"🛠️ 正在调用工具：{tool_name}"
             await _safe_edit_markdown(sent, _current_stream_render())
-        elif event.startswith("done:"):
-            tool_name = event.split(":", maxsplit=1)[1].strip()
+        elif action == "done":
             if tool_name == "search":
-                tool_status = "✅ 联网搜索完成，正在生成最终回答..."
+                if display_query:
+                    tool_status = f"✅ 联网搜索完成（{display_query}），正在生成最终回答..."
+                else:
+                    tool_status = "✅ 联网搜索完成，正在生成最终回答..."
             elif tool_name in {"", "undefined", "unknown_tool"}:
                 tool_status = "✅ 工具调用完成，正在生成最终回答..."
             else:

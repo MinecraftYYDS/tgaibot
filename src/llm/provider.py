@@ -203,11 +203,13 @@ class LLMProvider:
                     parsed_args = {}
 
                 argument = ""
+                search_query = ""
                 if name in {"search", "web_search"}:
                     query = str(parsed_args.get("query") or "").strip()
                     max_results = int(parsed_args.get("max_results") or 5)
                     argument = f"{query} | {max_results}"
                     tool_name = "search"
+                    search_query = query
                 elif name == "echo":
                     argument = str(parsed_args.get("text") or "")
                     tool_name = "echo"
@@ -218,13 +220,13 @@ class LLMProvider:
 
                 logger.debug(f"[tool-execute] name={tool_name} argument={repr(argument[:50] if len(argument) > 50 else argument)}")
                 if on_tool_event is not None:
-                    event_msg = f"start:{tool_name}"
+                    event_msg = f"start:{tool_name}:{search_query}" if tool_name == "search" else f"start:{tool_name}"
                     logger.debug(f"[tool-event-callback] sending={repr(event_msg)}")
                     await on_tool_event(event_msg)
                 tool_result = await execute_builtin_tool(tool_name, argument)
                 logger.debug(f"[tool-result] {tool_name}={repr(tool_result[:100] if len(tool_result) > 100 else tool_result)}")
                 if on_tool_event is not None:
-                    event_msg = f"done:{tool_name}"
+                    event_msg = f"done:{tool_name}:{search_query}" if tool_name == "search" else f"done:{tool_name}"
                     logger.debug(f"[tool-event-callback] sending={repr(event_msg)}")
                     await on_tool_event(event_msg)
                 tool_call_id = str(tool_call.get("id") or "") if isinstance(tool_call, dict) else ""
