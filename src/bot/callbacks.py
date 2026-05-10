@@ -37,9 +37,21 @@ async def on_stop(callback: CallbackQuery) -> None:
 
 @router.callback_query(lambda c: c.data and c.data == "control:summarize")
 async def on_summarize(callback: CallbackQuery) -> None:
-    await callback.answer("Summary job queued")
+    if callback.message and callback.message.message_thread_id is not None:
+        key = TopicKey(chat_id=callback.message.chat.id, message_thread_id=callback.message.message_thread_id)
+        session_manager.enqueue_job(key=key, job_type="summarize", payload={"source": "button"})
+        await callback.answer("Summary job queued")
+        return
+    await callback.answer("No topic context")
 
 
 @router.callback_query(lambda c: c.data and c.data == "control:clear")
 async def on_clear(callback: CallbackQuery) -> None:
-    await callback.answer("Context clear requested")
+    if callback.message and callback.message.message_thread_id is not None:
+        key = TopicKey(chat_id=callback.message.chat.id, message_thread_id=callback.message.message_thread_id)
+        changed = session_manager.clear_topic_messages(key)
+        await callback.answer(f"Context cleared: {changed} messages")
+        if callback.message:
+            await callback.message.answer(f"Cleared context: {changed} messages")
+        return
+    await callback.answer("No topic context")

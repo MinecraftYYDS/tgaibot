@@ -116,6 +116,11 @@ async def on_text(message: Message) -> None:
         content=final_text,
         reasoning=reasoning,
     )
+    msg_count = session_manager.topic_message_count(topic_key)
+    if msg_count == 2:
+        session_manager.enqueue_job(topic_key, job_type="rename_topic", payload={"source": "auto"})
+    if msg_count > 0 and msg_count % 10 == 0:
+        session_manager.enqueue_job(topic_key, job_type="summarize", payload={"source": "auto", "count": msg_count})
     if stop_reason != "completed":
         session_manager.save_streaming_checkpoint(
             key=topic_key,
@@ -135,6 +140,7 @@ async def on_deleted_business_messages(event: MessageDeleted) -> None:
     key = TopicKey(chat_id=event.chat.id, message_thread_id=thread_id)
     changed = 0
     for message_id in event.message_ids:
+        session_manager.enqueue_job(key=key, job_type="delete_sync", payload={"telegram_message_id": message_id})
         if session_manager.mark_deleted(key, message_id):
             changed += 1
     logger.info("Deleted sync applied chat=%s thread=%s changed=%s", event.chat.id, thread_id, changed)

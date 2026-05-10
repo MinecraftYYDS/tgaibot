@@ -11,6 +11,7 @@ from src.api.routes import router as api_router
 from src.bot.callbacks import router as callbacks_router
 from src.bot.handlers import router as handlers_router
 from src.config import settings
+from src.jobs.worker import run_job_worker
 from src.logging_setup import setup_logging
 from src.persistence.migrations import run_migrations
 
@@ -28,7 +29,7 @@ async def run_bot() -> None:
     dp = Dispatcher()
     dp.include_router(callbacks_router)
     dp.include_router(handlers_router)
-    await dp.start_polling(bot)
+    await asyncio.gather(dp.start_polling(bot), run_job_worker(bot))
 
 
 async def run_api() -> None:

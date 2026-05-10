@@ -1,0 +1,68 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+
+from aiogram import Bot
+
+from src.bot.runtime import provider, session_manager
+from src.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+async def run_job_worker(bot: Bot) -> None:
+    while True:
+        try:
+            claimed = session_manager.claim_next_pending_job()
+            if not claimed:
+                await asyncio.sleep(1.0)
+                continue
+            job_id, topic_id, job_type, payload = claimed
+            await _execute_job(bot=bot, job_id=job_id, topic_id=topic_id, job_type=job_type, payload=payload)
+            session_manager.finish_job(job_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("Job worker tick failed")
+            await asyncio.sleep(1.0)
+
+
+async def _execute_job(bot: Bot, job_id: int, topic_id: int, job_type: str, payload: dict[str, object]) -> None:
+    key = session_manager.topic_key_by_topic_id(topic_id)
+    if key is None:
+        return
+
+    if job_type == "summarize":
+        context = session_manager.collect_context_for_summary(key, max_messages=40)
+        if not context.strip():
+            return
+        prompt = (
+            "请将以下对话总结为 5 条以内要点，中文输出，保留关键结论和待办。\n\n"
+            + context
+        )
+        result = await provider.generate(prompt=prompt, model=settings.auto_reasoning_model_id)
+        session_manager.set_topic_summary(key, result.final_text)
+        return
+
+    if job_type == "rename_topic":
+        context = session_manager.collect_context_for_summary(key, max_messages=12)
+        if not context.strip():
+            return
+        prompt = "为该话题生成一个简洁中文标题，12字以内，不要标点。\n\n" + context
+        result = await provider.generate(prompt=prompt, model=settings.auto_simple_model_id)
+        title = result.final_text.strip().splitlines()[0][:12]
+        if title:
+            session_manager.set_topic_title(key, title)
+            try:
+                await bot.edit_forum_topic(chat_id=key.chat_id, message_thread_id=key.message_thread_id, name=title)
+            except Exception:  # noqa: BLE001
+                logger.warning("edit_forum_topic failed for chat=%s thread=%s", key.chat_id, key.message_thread_id)
+        return
+
+    if job_type == "delete_sync":
+        message_id = int(payload.get("telegram_message_id", 0)) if payload else 0
+        if message_id <= 0:
+            return
+        session_manager.mark_deleted(key, message_id)
+        return
+
+    logger.info("skip unknown job type=%s job_id=%s", job_type, job_id)
