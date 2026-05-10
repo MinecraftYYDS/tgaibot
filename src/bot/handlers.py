@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from contextlib import suppress
 from time import monotonic
 
 from aiogram import F, Router
@@ -235,11 +234,13 @@ async def on_text(message: Message) -> None:
         while not thinking_timer_stop.is_set():
             if built_answer:
                 break
-            await _safe_edit_markdown(sent, _current_stream_render())
             try:
                 await asyncio.wait_for(thinking_timer_stop.wait(), timeout=1)
             except asyncio.TimeoutError:
-                continue
+                pass
+            if thinking_timer_stop.is_set() or built_answer:
+                break
+            await _safe_edit_markdown(sent, _current_stream_render())
 
     thinking_timer_task = asyncio.create_task(_thinking_timer_loop())
     try:
@@ -302,9 +303,7 @@ async def on_text(message: Message) -> None:
             built_answer += f"\n\n❌ 错误: {type(exc).__name__}: {exc}"
     finally:
         thinking_timer_stop.set()
-        thinking_timer_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await thinking_timer_task
+        await thinking_timer_task
         generation_control.end(topic_key.value)
 
     reasoning_text = "route_decision -> stream_generate"
