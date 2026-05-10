@@ -5,8 +5,7 @@ from time import monotonic
 
 from aiogram import F, Router
 from aiogram.filters import Command
-from aiogram.types import Message
-from aiogram.types import MessageDeleted
+from aiogram.types import BusinessMessagesDeleted, Message
 
 from src.bot.keyboards import control_keyboard, model_selection_keyboard
 from src.bot.runtime import generation_control, model_router, provider, session_manager
@@ -132,7 +131,7 @@ async def on_text(message: Message) -> None:
 
 
 @router.deleted_business_messages()
-async def on_deleted_business_messages(event: MessageDeleted) -> None:
+async def on_deleted_business_messages(event: BusinessMessagesDeleted) -> None:
     # This update type is for business mode; kept for compatibility.
     if event.chat is None or event.message_ids is None:
         return
