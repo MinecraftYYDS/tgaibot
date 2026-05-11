@@ -206,7 +206,7 @@ def _build_ping_text(
         failed_count = sum(1 for ok in results.values() if ok is False)
         lines.append("")
         if failed_count:
-            lines.append(f"已将 {failed_count} 个不可用模型标红，可重新运行 /ping 恢复")
+            lines.append(f"已标记 {failed_count} 个不可用模型，可重新运行 /ping 重新检测状态")
         else:
             lines.append("所有模型均可用 ✅")
     return "\n".join(lines)
