@@ -123,9 +123,22 @@ def _split_telegram_text(text: str, limit: int = 3500) -> list[str]:
 def _clip_stream_render(text: str) -> str:
     if len(text) <= TELEGRAM_RENDER_LIMIT:
         return text
-    suffix = "\n\n...(消息较长，仍在生成中)"
-    max_main = max(0, TELEGRAM_RENDER_LIMIT - len(suffix))
-    return text[:max_main] + suffix
+    return _truncate_with_dynamic_omission(text, TELEGRAM_RENDER_LIMIT, "消息较长，仍在生成中")
+
+
+def _truncate_with_dynamic_omission(text: str, limit: int, label: str) -> str:
+    if len(text) <= limit:
+        return text
+
+    omitted_chars = max(0, len(text) - limit)
+    for _ in range(4):
+        suffix = f"\n\n...({label}...已省略{omitted_chars}字)"
+        visible_len = max(0, limit - len(suffix))
+        omitted_chars = max(0, len(text) - visible_len)
+
+    suffix = f"\n\n...({label}...已省略{omitted_chars}字)"
+    visible_len = max(0, limit - len(suffix))
+    return text[:visible_len] + suffix
 
 
 def _split_preview_and_tail(text: str, head_chars: int = PREVIEW_CHARS_ON_OVERFLOW) -> tuple[str, str]:
@@ -145,7 +158,8 @@ async def _send_tail_as_txt(message: Message, topic_key: TopicKey, tail_text: st
 async def _send_refreshed_content(message: Message, topic_key: TopicKey, full_text: str) -> None:
     preview, overflow = _split_preview_and_tail(full_text)
     if overflow:
-        preview_msg = await message.answer(preview + "\n\n...(内容过长，剩余内容见txt附件)", reply_markup=control_keyboard())
+        preview_text = _truncate_with_dynamic_omission(full_text, PREVIEW_CHARS_ON_OVERFLOW, "内容过长，剩余内容见txt附件")
+        preview_msg = await message.answer(preview_text, reply_markup=control_keyboard())
         from src.bot import runtime
         runtime.assistant_full_text_by_message[(topic_key.chat_id, preview_msg.message_id)] = full_text
         await _send_tail_as_txt(message, topic_key, full_text)
@@ -808,8 +822,8 @@ async def _run_generation(
         return
 
     if len(final_render) > TELEGRAM_RENDER_LIMIT:
-        preview, _overflow = _split_preview_and_tail(final_text)
-        short_render = header + stats_text + preview + "\n\n...(内容过长，剩余内容见txt附件)"
+        preview_body = _truncate_with_dynamic_omission(final_text, PREVIEW_CHARS_ON_OVERFLOW, "内容过长，剩余内容见txt附件")
+        short_render = header + stats_text + preview_body
         await _safe_edit_markdown(sent, short_render, retry_on_flood=True, reply_markup=active_reply_markup)
         await _send_tail_as_txt(message, topic_key, final_text)
     else:
