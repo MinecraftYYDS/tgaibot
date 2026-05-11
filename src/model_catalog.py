@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,6 +28,7 @@ def _to_tags(raw: object) -> tuple[str, ...]:
 
 
 def load_model_catalog(config_path: str) -> list[ModelProfile]:
+    default_base_url = os.getenv("OPENAI_BASE_URL", "").strip() or "https://api.openai.com/v1"
     path = Path(config_path)
     if not path.exists():
         return [
@@ -35,7 +37,7 @@ def load_model_catalog(config_path: str) -> list[ModelProfile]:
                 label="OpenAI Default",
                 provider="openai_compatible",
                 model_name="gpt-4o-mini",
-                base_url="https://api.openai.com/v1",
+                base_url=default_base_url,
                 api_key_env="OPENAI_API_KEY",
                 tags=("simple", "reasoning", "long", "tool"),
             )
@@ -60,7 +62,7 @@ def load_model_catalog(config_path: str) -> list[ModelProfile]:
             label=str(item.get("label", model_id)).strip() or model_id,
             provider=str(item.get("provider", "openai_compatible")).strip() or "openai_compatible",
             model_name=str(item.get("model_name", "")).strip() or model_id,
-            base_url=str(item.get("base_url", "https://api.openai.com/v1")).strip() or "https://api.openai.com/v1",
+            base_url=str(item.get("base_url", "")).strip() or default_base_url,
             api_key_env=str(item.get("api_key_env", "OPENAI_API_KEY")).strip() or "OPENAI_API_KEY",
             tags=_to_tags(item.get("tags")),
         )
