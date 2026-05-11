@@ -326,6 +326,8 @@ async def on_new(message: Message) -> None:
 
 @router.message(Command("stop"))
 async def on_stop(message: Message) -> None:
+    if not await _ensure_ai_permission(message):
+        return
     if message.message_thread_id is None or message.message_thread_id == 0:
         await message.answer("⚠️ 请在话题内运行此命令")
         return
@@ -337,6 +339,9 @@ async def on_stop(message: Message) -> None:
 @router.message(Command("re"))
 async def on_refresh_by_command(message: Message) -> None:
     from src.bot import runtime
+
+    if not await _ensure_ai_permission(message):
+        return
 
     if message.message_thread_id is None or message.message_thread_id == 0:
         await message.answer("⚠️ 请在论坛话题内使用 /re")
