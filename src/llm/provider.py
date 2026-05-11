@@ -55,22 +55,8 @@ class LLMProvider:
                 raise ValueError(f"模型 {profile.id} 属于 TTS 语音模型，不能用于文本聊天。请切换到对话模型。")
             api_key = self._pick_api_key(profile.api_key_env)
             if api_key:
-                if on_tool_event is not None:
-                    final_text = await self._generate_with_tool_calls(
-                        prompt=prompt,
-                        profile_model_name=profile.model_name,
-                        profile_base_url=profile.base_url,
-                        api_key=api_key,
-                        context_messages=context_messages or [],
-                        on_tool_event=on_tool_event,
-                        image_bytes=image_bytes,
-                        image_mime_type=image_mime_type,
-                        tool_context=tool_context,
-                    )
-                    for chunk in self._chunk_text(final_text):
-                        yield chunk
-                    return
                 try:
+                    logger.debug("prefer streaming path model=%s", profile.model_name)
                     async for chunk in self._stream_openai_compatible(
                         prompt=prompt,
                         profile_model_name=profile.model_name,
@@ -107,22 +93,8 @@ class LLMProvider:
         if settings.openai_key_pool:
             fallback_model = settings.openai_model if model.startswith("openai_") else model
             api_key = self._pick_from_pool(settings.openai_key_pool, "OPENAI_API_KEYS")
-            if on_tool_event is not None:
-                final_text = await self._generate_with_tool_calls(
-                    prompt=prompt,
-                    profile_model_name=fallback_model,
-                    profile_base_url=settings.openai_base_url,
-                    api_key=api_key,
-                    context_messages=context_messages or [],
-                    on_tool_event=on_tool_event,
-                    image_bytes=image_bytes,
-                    image_mime_type=image_mime_type,
-                    tool_context=tool_context,
-                )
-                for chunk in self._chunk_text(final_text):
-                    yield chunk
-                return
             try:
+                logger.debug("prefer streaming path fallback_model=%s", fallback_model)
                 async for chunk in self._stream_openai_compatible(
                     prompt=prompt,
                     profile_model_name=fallback_model,
@@ -305,7 +277,7 @@ class LLMProvider:
             if not tool_calls:
                 reasoning = assistant_reasoning
                 self._last_reasoning_content = reasoning
-                return str(assistant_content or reasoning)
+                return str(assistant_content)
 
             for tool_call in tool_calls:
                 fn = (tool_call.get("function") or {}) if isinstance(tool_call, dict) else {}
@@ -397,7 +369,7 @@ class LLMProvider:
                 reasoning[:200],
             )
         self._last_reasoning_content = reasoning
-        return final_content or reasoning
+        return final_content
 
     async def _chat_openai_compatible(
         self,
