@@ -539,7 +539,7 @@ async def on_pins(message: Message) -> None:
         return
     lines = ["📌 当前会话钉住内容："]
     for item in items:
-        lines.append(f"{item.id}. {item.content}")
+        lines.append(f"{item['id']}. {item['content']}")
     await message.answer("\n".join(lines))
 
 
@@ -613,7 +613,7 @@ async def on_memory_list(message: Message) -> None:
 
     lines = ["🧠 当前长期记忆："]
     for item in items:
-        lines.append(f"{item.id}. [重要度 {item.importance}] {item.memory}")
+        lines.append(f"{item['id']}. [重要度 {item['importance']}] {item['memory']}")
     await message.answer("\n".join(lines))
 
 

@@ -369,7 +369,7 @@ class TopicSessionManager:
             db.refresh(row)
             return int(row.id)
 
-    def list_pinned_memories(self, key: TopicKey, limit: int = 20) -> list[PinnedMemory]:
+    def list_pinned_memories(self, key: TopicKey, limit: int = 20) -> list[dict[str, object]]:
         scope_type, scope_id = self._scope_for_key(key)
         with topic_transaction(key.value) as db:
             stmt = (
@@ -378,7 +378,16 @@ class TopicSessionManager:
                 .order_by(PinnedMemory.id.asc())
                 .limit(limit)
             )
-            return list(db.execute(stmt).scalars().all())
+            rows = db.execute(stmt).scalars().all()
+            return [
+                {
+                    "id": int(row.id),
+                    "content": str(row.content or ""),
+                    "created_by": int(row.created_by or 0),
+                    "created_at": row.created_at,
+                }
+                for row in rows
+            ]
 
     def remove_pinned_memory(self, key: TopicKey, pin_id: int) -> bool:
         scope_type, scope_id = self._scope_for_key(key)
@@ -406,7 +415,7 @@ class TopicSessionManager:
             db.refresh(row)
             return int(row.id)
 
-    def list_long_term_memories(self, user_id: int, limit: int = 10) -> list[LongTermMemory]:
+    def list_long_term_memories(self, user_id: int, limit: int = 10) -> list[dict[str, object]]:
         key = TopicKey(chat_id=user_id, message_thread_id=0)
         with topic_transaction(key.value) as db:
             stmt = (
@@ -415,7 +424,17 @@ class TopicSessionManager:
                 .order_by(LongTermMemory.importance.desc(), LongTermMemory.updated_at.desc(), LongTermMemory.id.desc())
                 .limit(limit)
             )
-            return list(db.execute(stmt).scalars().all())
+            rows = db.execute(stmt).scalars().all()
+            return [
+                {
+                    "id": int(row.id),
+                    "memory": str(row.memory or ""),
+                    "importance": int(row.importance or 1),
+                    "created_at": row.created_at,
+                    "updated_at": row.updated_at,
+                }
+                for row in rows
+            ]
 
     def remove_long_term_memory(self, user_id: int, memory_id: int) -> bool:
         key = TopicKey(chat_id=user_id, message_thread_id=0)
