@@ -305,7 +305,7 @@ class LLMProvider:
             if not tool_calls:
                 reasoning = assistant_reasoning
                 self._last_reasoning_content = reasoning
-                return str(assistant_content)
+                return str(assistant_content or reasoning)
 
             for tool_call in tool_calls:
                 fn = (tool_call.get("function") or {}) if isinstance(tool_call, dict) else {}
@@ -397,7 +397,7 @@ class LLMProvider:
                 reasoning[:200],
             )
         self._last_reasoning_content = reasoning
-        return final_content
+        return final_content or reasoning
 
     async def _chat_openai_compatible(
         self,
