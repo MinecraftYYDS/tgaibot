@@ -14,7 +14,7 @@ import httpx
 
 from src.config import settings
 from src.model_catalog import resolve_model
-from src.llm.tools import execute_builtin_tool, try_extract_tool_intent
+from src.llm.tools import execute_builtin_tool, execute_builtin_tool_with_context, try_extract_tool_intent
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,7 @@ class LLMProvider:
         on_tool_event: Callable[[str], Awaitable[None]] | None = None,
         image_bytes: bytes | None = None,
         image_mime_type: str = "image/jpeg",
+        tool_context: dict[str, object] | None = None,
     ) -> AsyncIterator[str]:
         tool_intent = try_extract_tool_intent(prompt)
         if tool_intent is not None:
@@ -54,6 +55,21 @@ class LLMProvider:
                 raise ValueError(f"模型 {profile.id} 属于 TTS 语音模型，不能用于文本聊天。请切换到对话模型。")
             api_key = self._pick_api_key(profile.api_key_env)
             if api_key:
+                if on_tool_event is not None:
+                    final_text = await self._generate_with_tool_calls(
+                        prompt=prompt,
+                        profile_model_name=profile.model_name,
+                        profile_base_url=profile.base_url,
+                        api_key=api_key,
+                        context_messages=context_messages or [],
+                        on_tool_event=on_tool_event,
+                        image_bytes=image_bytes,
+                        image_mime_type=image_mime_type,
+                        tool_context=tool_context,
+                    )
+                    for chunk in self._chunk_text(final_text):
+                        yield chunk
+                    return
                 try:
                     async for chunk in self._stream_openai_compatible(
                         prompt=prompt,
@@ -81,6 +97,7 @@ class LLMProvider:
                         on_tool_event=on_tool_event,
                         image_bytes=image_bytes,
                         image_mime_type=image_mime_type,
+                        tool_context=tool_context,
                     )
                     for chunk in self._chunk_text(final_text):
                         yield chunk
@@ -90,6 +107,21 @@ class LLMProvider:
         if settings.openai_key_pool:
             fallback_model = settings.openai_model if model.startswith("openai_") else model
             api_key = self._pick_from_pool(settings.openai_key_pool, "OPENAI_API_KEYS")
+            if on_tool_event is not None:
+                final_text = await self._generate_with_tool_calls(
+                    prompt=prompt,
+                    profile_model_name=fallback_model,
+                    profile_base_url=settings.openai_base_url,
+                    api_key=api_key,
+                    context_messages=context_messages or [],
+                    on_tool_event=on_tool_event,
+                    image_bytes=image_bytes,
+                    image_mime_type=image_mime_type,
+                    tool_context=tool_context,
+                )
+                for chunk in self._chunk_text(final_text):
+                    yield chunk
+                return
             try:
                 async for chunk in self._stream_openai_compatible(
                     prompt=prompt,
@@ -117,6 +149,7 @@ class LLMProvider:
                     on_tool_event=on_tool_event,
                     image_bytes=image_bytes,
                     image_mime_type=image_mime_type,
+                    tool_context=tool_context,
                 )
                 for chunk in self._chunk_text(final_text):
                     yield chunk
@@ -145,6 +178,7 @@ class LLMProvider:
         on_tool_event: Callable[[str], Awaitable[None]] | None = None,
         image_bytes: bytes | None = None,
         image_mime_type: str = "image/jpeg",
+        tool_context: dict[str, object] | None = None,
     ) -> str:
         messages = self._build_messages(
             prompt=prompt,
@@ -200,6 +234,27 @@ class LLMProvider:
                     "parameters": {
                         "type": "object",
                         "properties": {"text": {"type": "string", "description": "要回显的文本"}},
+                        "required": ["text"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "memory_add",
+                    "description": "将关键信息写入记忆。私聊默认写长期记忆，群聊/话题默认写钉住记忆。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string", "description": "需要写入记忆的内容"},
+                            "kind": {
+                                "type": "string",
+                                "description": "记忆类型：auto/long_term/pinned",
+                                "enum": ["auto", "long_term", "pinned"],
+                                "default": "auto",
+                            },
+                            "importance": {"type": "integer", "description": "长期记忆重要度 1-10", "default": 1},
+                        },
                         "required": ["text"],
                     },
                 },
@@ -273,6 +328,14 @@ class LLMProvider:
                     max_chars = int(parsed_args.get("max_chars") or 5000)
                     argument = f"{url} | {max_chars}"
                     tool_name = "fetch_webpage"
+                elif name in {"memory_add", "remember"}:
+                    payload = {
+                        "text": str(parsed_args.get("text") or "").strip(),
+                        "kind": str(parsed_args.get("kind") or "auto").strip(),
+                        "importance": int(parsed_args.get("importance") or 1),
+                    }
+                    argument = json.dumps(payload, ensure_ascii=False)
+                    tool_name = "memory_add"
                 else:
                     tool_name = name if name else "unknown_tool"
 
@@ -281,7 +344,7 @@ class LLMProvider:
                     event_msg = f"start:{tool_name}:{search_query}" if tool_name == "search" else f"start:{tool_name}"
                     logger.debug(f"[tool-event-callback] sending={repr(event_msg)}")
                     await on_tool_event(event_msg)
-                tool_result = await execute_builtin_tool(tool_name, argument)
+                tool_result = await execute_builtin_tool_with_context(tool_name, argument, tool_context)
                 logger.debug(f"[tool-result] {tool_name}={repr(tool_result[:100] if len(tool_result) > 100 else tool_result)}")
                 if on_tool_event is not None:
                     event_msg = f"done:{tool_name}:{search_query}" if tool_name == "search" else f"done:{tool_name}"
@@ -416,7 +479,14 @@ class LLMProvider:
         image_mime_type: str = "image/jpeg",
     ) -> list[dict]:
         messages: list[dict] = [
-            {"role": "system", "content": "你是一个有帮助的AI助手。请用中文回答用户的问题。尽可能简洁、准确、有用。"},
+            {
+                "role": "system",
+                "content": (
+                    "你是一个有帮助的AI助手。请用中文回答用户的问题。尽可能简洁、准确、有用。"
+                    "当用户明确给出稳定偏好、长期约束或关键事实时，可调用 memory_add 工具写入记忆；"
+                    "私聊优先写长期记忆，群话题优先写钉住记忆。"
+                ),
+            },
         ]
         if context_messages:
             for msg in context_messages:

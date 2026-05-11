@@ -972,6 +972,12 @@ async def _run_generation(
             on_tool_event=_tool_event_to_chat,
             image_bytes=image_bytes,
             image_mime_type=image_mime_type,
+            tool_context={
+                "chat_type": message.chat.type,
+                "chat_id": topic_key.chat_id,
+                "message_thread_id": topic_key.message_thread_id,
+                "user_id": message.from_user.id if message.from_user else 0,
+            },
         ):
             if generation_control.should_stop(topic_key.value):
                 stop_reason = "user_stop"
@@ -1024,6 +1030,12 @@ async def _run_generation(
                     on_tool_event=_tool_event_to_chat,
                     image_bytes=image_bytes,
                     image_mime_type=image_mime_type,
+                    tool_context={
+                        "chat_type": message.chat.type,
+                        "chat_id": topic_key.chat_id,
+                        "message_thread_id": topic_key.message_thread_id,
+                        "user_id": message.from_user.id if message.from_user else 0,
+                    },
                 ):
                     if generation_control.should_stop(topic_key.value):
                         stop_reason = "user_stop"

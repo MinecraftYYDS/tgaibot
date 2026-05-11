@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from asyncio import to_thread
 from datetime import datetime
@@ -133,7 +134,77 @@ async def execute_builtin_tool(name: str, argument: str) -> str:
             return await to_thread(_run_web_fetch, url, max_chars)
         except Exception as exc:  # noqa: BLE001
             return f"tool_error:fetch_webpage {type(exc).__name__}: {exc}"
+    if name in {"memory_add", "remember"}:
+        return "tool_error:memory_add missing context"
     return f"unsupported_tool:{name}"
+
+
+async def execute_builtin_tool_with_context(name: str, argument: str, context: dict[str, object] | None) -> str:
+    if name not in {"memory_add", "remember"}:
+        return await execute_builtin_tool(name, argument)
+
+    if context is None:
+        return "tool_error:memory_add missing context"
+
+    try:
+        parsed = json.loads(argument) if argument else {}
+    except json.JSONDecodeError:
+        parsed = {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    text = str(parsed.get("text") or "").strip()
+    if not text:
+        return "tool_error:memory_add text is empty"
+
+    kind = str(parsed.get("kind") or "auto").strip().lower()
+    importance_raw = parsed.get("importance")
+    try:
+        importance = int(importance_raw) if importance_raw is not None else 1
+    except (TypeError, ValueError):
+        importance = 1
+    importance = max(1, min(10, importance))
+
+    chat_type = str(context.get("chat_type") or "")
+    is_private = chat_type == "private"
+    user_id_raw = context.get("user_id")
+    try:
+        user_id = int(user_id_raw) if user_id_raw is not None else 0
+    except (TypeError, ValueError):
+        user_id = 0
+
+    if kind in {"long_term", "long", "private"} or (kind == "auto" and is_private):
+        if user_id <= 0:
+            return "tool_error:memory_add invalid user_id"
+        from src.bot.runtime import session_manager
+
+        memory_id = session_manager.add_long_term_memory(user_id=user_id, memory=text, importance=importance)
+        if memory_id <= 0:
+            return "tool_error:memory_add failed"
+        return f"memory_add ok: long_term id={memory_id}"
+
+    chat_id_raw = context.get("chat_id")
+    thread_id_raw = context.get("message_thread_id")
+    try:
+        chat_id = int(chat_id_raw) if chat_id_raw is not None else 0
+    except (TypeError, ValueError):
+        chat_id = 0
+    try:
+        thread_id = int(thread_id_raw) if thread_id_raw is not None else 0
+    except (TypeError, ValueError):
+        thread_id = 0
+    if chat_id == 0:
+        return "tool_error:memory_add invalid chat_id"
+
+    from src.bot.runtime import session_manager
+    from src.session.manager import TopicKey
+
+    key = TopicKey(chat_id=chat_id, message_thread_id=thread_id)
+    session_manager.get_or_create_topic(key)
+    pin_id = session_manager.add_pinned_memory(key=key, content=text, created_by=user_id)
+    if pin_id <= 0:
+        return "tool_error:memory_add failed"
+    return f"memory_add ok: pinned id={pin_id}"
 
 
 def try_extract_tool_intent(prompt: str) -> tuple[str, str] | None:
