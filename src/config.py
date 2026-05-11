@@ -41,6 +41,7 @@ class Settings(BaseSettings):
 
     fastapi_host: str = Field(default="127.0.0.1", alias="FASTAPI_HOST")
     fastapi_port: int = Field(default=8011, alias="FASTAPI_PORT")
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     @staticmethod
     def _parse_int_set(raw: str) -> set[int]:
