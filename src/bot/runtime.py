@@ -41,3 +41,7 @@ active_stream_snapshots: dict[str, ActiveStreamSnapshot] = {}
 
 # Topics manually taken over by user refresh action.
 user_takeover_topics: set[str] = set()
+
+# Full assistant text by concrete Telegram message.
+# key: (chat_id, telegram_message_id)
+assistant_full_text_by_message: dict[tuple[int, int], str] = {}

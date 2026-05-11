@@ -140,10 +140,14 @@ async def _send_tail_as_txt(message: Message, topic_key: TopicKey, tail_text: st
 async def _send_refreshed_content(message: Message, topic_key: TopicKey, full_text: str) -> None:
     preview, overflow = _split_preview_and_tail(full_text)
     if overflow:
-        await message.answer(preview + "\n\n...(内容过长，剩余内容见txt附件)", reply_markup=control_keyboard())
+        preview_msg = await message.answer(preview + "\n\n...(内容过长，剩余内容见txt附件)", reply_markup=control_keyboard())
+        from src.bot import runtime
+        runtime.assistant_full_text_by_message[(topic_key.chat_id, preview_msg.message_id)] = full_text
         await _send_tail_as_txt(message, topic_key, full_text)
         return
-    await message.answer(preview, reply_markup=control_keyboard())
+    preview_msg = await message.answer(preview, reply_markup=control_keyboard())
+    from src.bot import runtime
+    runtime.assistant_full_text_by_message[(topic_key.chat_id, preview_msg.message_id)] = full_text
 
 
 async def _cleanup_new_topic_seed_messages(topic_key: TopicKey) -> None:
@@ -291,6 +295,8 @@ async def on_refresh_by_command(message: Message) -> None:
     snapshot = runtime.active_stream_snapshots.get(topic_key.value)
     if snapshot is not None and snapshot.assistant_message_id == replied_message_id:
         latest_text = snapshot.latest_answer_text or snapshot.latest_render_text or ""
+    if not latest_text:
+        latest_text = runtime.assistant_full_text_by_message.get((topic_key.chat_id, replied_message_id), "")
     if not latest_text:
         latest_text = session_manager.get_assistant_content_by_telegram_message_id(topic_key, replied_message_id)
 
@@ -806,6 +812,7 @@ async def _run_generation(
 
     runtime.active_stream_snapshots.pop(topic_key.value, None)
     runtime.user_takeover_topics.discard(topic_key.value)
+    runtime.assistant_full_text_by_message[(topic_key.chat_id, sent.message_id)] = final_text
     session_manager.append_message(
         key=topic_key,
         telegram_message_id=sent.message_id,
