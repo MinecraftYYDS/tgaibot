@@ -5,7 +5,7 @@ import logging
 from time import monotonic
 
 from aiogram import F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command
 from aiogram.types import BusinessMessagesDeleted, Message
 
@@ -20,21 +20,36 @@ logger = logging.getLogger(__name__)
 router = Router(name="handlers")
 
 
-async def _safe_edit_markdown(message: Message, text: str) -> None:
-    try:
-        await message.edit_text(text, reply_markup=control_keyboard(), parse_mode="Markdown")
-    except TelegramBadRequest as exc:
-        error_text = str(exc).lower()
-        if "message is not modified" in error_text:
-            return
-        if "parse entities" not in error_text:
-            raise
+async def _safe_edit_markdown(message: Message, text: str, retry_on_flood: bool = False) -> None:
+    """Edit a message with Markdown; falls back to plain text on parse error.
+
+    During streaming (retry_on_flood=False) rate-limit errors are silently
+    skipped so the generator can continue.  For the final edit pass
+    retry_on_flood=True to wait and retry up to a few times.
+    """
+    max_flood_attempts = 4 if retry_on_flood else 1
+    for flood_attempt in range(max_flood_attempts):
         try:
-            await message.edit_text(text, reply_markup=control_keyboard())
-        except TelegramBadRequest as fallback_exc:
-            if "message is not modified" in str(fallback_exc).lower():
+            await message.edit_text(text, reply_markup=control_keyboard(), parse_mode="Markdown")
+            return
+        except TelegramRetryAfter as exc:
+            if retry_on_flood and flood_attempt < max_flood_attempts - 1:
+                await asyncio.sleep(exc.retry_after)
+                continue
+            return  # skip this update if not retrying or attempts exhausted
+        except TelegramBadRequest as exc:
+            error_text = str(exc).lower()
+            if "message is not modified" in error_text:
                 return
-            raise
+            if "parse entities" not in error_text:
+                raise
+            try:
+                await message.edit_text(text, reply_markup=control_keyboard())
+                return
+            except TelegramBadRequest as fallback_exc:
+                if "message is not modified" in str(fallback_exc).lower():
+                    return
+                raise
 
 
 def _compact_query_for_status(query: str, max_len: int = 60) -> str:
@@ -84,18 +99,34 @@ async def on_new(message: Message) -> None:
             topic_key = TopicKey(chat_id=message.chat.id, message_thread_id=topic_id)
             session_manager.get_or_create_topic(topic_key)
             topic_link = f"https://t.me/c/{str(message.chat.id)[4:]}/{topic_id}"
-            await message.answer(
-                f"✅ 已创建新话题：[点我进入新话题]({topic_link})",
-                parse_mode="Markdown",
-                disable_web_page_preview=True,
-            )
+            for attempt in range(4):
+                try:
+                    await message.answer(
+                        f"✅ 已创建新话题：[点我进入新话题]({topic_link})",
+                        parse_mode="Markdown",
+                        disable_web_page_preview=True,
+                    )
+                    break
+                except TelegramRetryAfter as exc:
+                    if attempt < 3:
+                        await asyncio.sleep(exc.retry_after)
+                    else:
+                        raise
             # Send initialization message in the new topic, not in the main forum
-            await bot.send_message(
-                chat_id=message.chat.id,
-                message_thread_id=topic_id,
-                text="📌 新话题已创建，请选择此话题的模型模式：",
-                reply_markup=model_selection_keyboard()
-            )
+            for attempt in range(4):
+                try:
+                    await bot.send_message(
+                        chat_id=message.chat.id,
+                        message_thread_id=topic_id,
+                        text="📌 新话题已创建，请选择此话题的模型模式：",
+                        reply_markup=model_selection_keyboard()
+                    )
+                    break
+                except TelegramRetryAfter as exc:
+                    if attempt < 3:
+                        await asyncio.sleep(exc.retry_after)
+                    else:
+                        raise
         except Exception as e:
             await message.answer(f"❌ 创建话题失败: {e}")
         return
@@ -138,6 +169,109 @@ async def on_search(message: Message) -> None:
         await message.answer(f"❌ 联网搜索失败：{result}")
         return
     await message.answer(f"✅ 联网搜索完成：{display_query}")
+
+
+# ---------------------------------------------------------------------------
+# /ping helpers
+# ---------------------------------------------------------------------------
+
+def _build_ping_text(
+    models: list,
+    results: dict[str, bool | None],
+    finished: bool = False,
+) -> str:
+    """Build a clean progress/result text for /ping."""
+    total = len(models)
+    done_count = sum(1 for v in results.values() if v is not None)
+
+    if finished:
+        header_line = f"✅ 模型测试完成 [{done_count}/{total}]"
+    else:
+        header_line = f"🔍 正在测试模型连通性 [{done_count}/{total}]"
+
+    lines = [header_line, ""]
+    for model in models:
+        status = results.get(model.id)
+        if status is True:
+            icon = "✅"
+        elif status is False:
+            icon = "❌"
+        else:
+            # Find the first untested model – that's the one currently running
+            untested = [m for m in models if results.get(m.id) is None]
+            icon = "⏳" if untested and untested[0].id == model.id else "⬜"
+        lines.append(f"{icon} {model.label}")
+
+    if finished:
+        failed_count = sum(1 for ok in results.values() if ok is False)
+        lines.append("")
+        if failed_count:
+            lines.append(f"已将 {failed_count} 个不可用模型标红，可重新运行 /ping 恢复")
+        else:
+            lines.append("所有模型均可用 ✅")
+    return "\n".join(lines)
+
+
+async def _ping_single_model(model_id: str, timeout: float = 30.0) -> bool:
+    """Send a minimal prompt to a model and return True if it responds."""
+    try:
+        async def _collect() -> str:
+            parts: list[str] = []
+            async for chunk in provider.stream_generate(prompt="hi", model=model_id):
+                parts.append(chunk)
+            return "".join(parts)
+
+        response = await asyncio.wait_for(_collect(), timeout=timeout)
+        stripped = response.strip()
+        # Three conditions for a "live" response:
+        # 1. non-empty, 2. not the echo fallback (no API key configured),
+        # 3. not an upstream HTTP error message returned by the provider.
+        return bool(stripped) and not stripped.startswith("[model=") and "上游接口请求失败" not in stripped
+    except Exception:
+        return False
+
+
+@router.message(Command("ping"))
+async def on_ping(message: Message) -> None:
+    # Allowed only in private chat or the default (non-thread) topic.
+    is_private = message.chat.type == "private"
+    is_default_topic = message.message_thread_id is None or message.message_thread_id == 0
+
+    if not (is_private or is_default_topic):
+        await message.answer("⚠️ /ping 只能在私聊或群组默认话题中使用")
+        return
+
+    user_id = message.from_user.id if message.from_user else None
+    if user_id is None or user_id not in settings.allowed_user_ids:
+        await message.answer("❌ 无权限使用此命令（仅限 TELEGRAM_ALLOWED_USER_IDS 中的用户）")
+        return
+
+    models = [m for m in settings.model_catalog if "tts" not in m.tags]
+    if not models:
+        await message.answer("❌ 没有可测试的模型")
+        return
+
+    results: dict[str, bool | None] = {m.id: None for m in models}
+    status_msg = await message.answer(_build_ping_text(models, results))
+
+    for model in models:
+        ok = await _ping_single_model(model.id)
+        results[model.id] = ok
+        try:
+            await status_msg.edit_text(_build_ping_text(models, results))
+        except (TelegramBadRequest, TelegramRetryAfter):
+            pass
+
+    # Update the global failed set used by model_selection_keyboard.
+    # We import the module (not the name) so the assignment mutates the
+    # actual module-level variable rather than a stale local binding.
+    from src.bot import runtime as _rt
+    _rt.failed_ping_models = {m_id for m_id, ok in results.items() if ok is False}
+
+    try:
+        await status_msg.edit_text(_build_ping_text(models, results, finished=True))
+    except (TelegramBadRequest, TelegramRetryAfter):
+        pass
 
 
 @router.message(F.text)
@@ -316,10 +450,10 @@ async def on_text(message: Message) -> None:
         final_text += "\n\n（含错误）"
 
     total_elapsed = _format_elapsed(monotonic() - started_at)
-    stats_text = f"\n\n⌛️ 用时：{total_elapsed}\n⚒️ 调用工具：{tool_call_count} 次"
-    final_render = header + final_text + stats_text
+    stats_text = f"⌛️ 用时：{total_elapsed}\n⚒️ 调用工具：{tool_call_count} 次\n\n"
+    final_render = header + stats_text + final_text
 
-    await _safe_edit_markdown(sent, final_render)
+    await _safe_edit_markdown(sent, final_render, retry_on_flood=True)
     session_manager.append_message(
         key=topic_key,
         telegram_message_id=sent.message_id,

@@ -15,3 +15,6 @@ model_router = ModelRouter()
 provider = LLMProvider()
 generation_control = GenerationControl()
 bot: Bot | None = None
+
+# Models that failed the last /ping test; cleared/updated on each /ping run.
+failed_ping_models: set[str] = set()
