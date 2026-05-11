@@ -247,18 +247,44 @@ def _extract_main_forum_mention_prompt(message: Message) -> str:
     return prompt
 
 
+def _build_help_text() -> str:
+    return (
+        "🤖 机器人帮助\n\n"
+        "权限规则：\n"
+        "- 白名单群（TELEGRAM_ALLOWED_CHAT_IDS）内成员可直接使用\n"
+        "- 私聊需在 TELEGRAM_ALLOWED_USER_IDS 中\n\n"
+        "私聊：\n"
+        "- 直接发送文本即可对话\n"
+        "- /model auto 或 /model 模型ID：切换私聊模型\n"
+        "- /new：清空当前私聊记忆（消息/摘要/钉住/长期记忆/向量）\n"
+        "- /memory_add 内容：添加长期记忆\n"
+        "- /memory_list：查看长期记忆\n"
+        "- /memory_del 记忆ID：删除一条长期记忆\n"
+        "- /memory_clear：清空长期记忆\n\n"
+        "群组 Topic：\n"
+        "- 主话题发送 @bot + 问题，可直接问\n"
+        "- 主话题 /new：自动创建新话题\n"
+        "- 子话题内直接聊天\n"
+        "- /stop：停止当前话题生成\n"
+        "- /re：引用 AI 回复后刷新该条输出\n\n"
+        "通用命令：\n"
+        "- /models：查看可用模型\n"
+        "- /search 关键词 | 结果数：联网搜索\n"
+        "- /pin 内容：钉住当前作用域信息\n"
+        "- /pins：查看当前作用域钉住内容\n"
+        "- /unpin ID：取消钉住\n"
+        "- /ping：检测模型可用性（私聊或群主话题）\n"
+    )
+
+
 @router.message(Command("start"))
 async def on_start(message: Message) -> None:
-    await message.answer(
-        "🤖 机器人已在线。\n\n"
-        "在论坛群组中：\n"
-        "1️⃣ 在主话题发送 /new 自动创建新话题\n"
-        "2️⃣ 进入新话题后开始聊天\n"
-        "3️⃣ 可用 /search 关键词 进行联网搜索\n\n"
-        "按钮说明：\n"
-        "- 对话总结：提炼当前话题的结论、要点和待办\n"
-        "- 停止生成：中断当前回复"
-    )
+    await message.answer("🤖 机器人已在线，发送 /help 查看完整使用说明。\n\n" + _build_help_text())
+
+
+@router.message(Command("help"))
+async def on_help(message: Message) -> None:
+    await message.answer(_build_help_text())
 
 
 @router.message(Command("new"))

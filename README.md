@@ -8,20 +8,21 @@
 
 ### 1. 项目目标
 
-本项目实现一个运行在 Telegram 群组 Topics 模式下的 AI Bot：
+本项目实现一个支持 Telegram 私聊 + 群组 Topics 的 AI Bot：
 
-- 每个 Topic 是独立会话
+- 私聊与每个 Topic 都是独立会话
 - 支持 Auto 路由与手动切换模型
 - 支持自定义 base_url、自定义 model_name、多模型目录配置
 - 支持流式回复和强制停止
 - 支持会话状态持久化、模型切换审计、checkpoint
 - 支持后台作业：自动总结、自动改名、删除同步补偿
+- 支持记忆系统：结构化摘要、长期记忆、钉住内容、向量检索
 
 ### 2. 当前能力
 
 - 运行时：aiogram + FastAPI 同进程
 - 数据层：SQLite + WAL + 每 Topic 串行事务锁
-- 核心命令：/start, /new, /stop, /models
+- 核心命令：/start, /help, /new, /stop, /models
 - 模型系统：
 	- Auto 模式
 	- 动态模型按钮（来自模型目录）
@@ -30,6 +31,11 @@
 	- 流式编辑回复
 	- Stop 按钮和 /stop 中断
 	- 中断后 checkpoint 落库
+- 记忆系统：
+	- 私聊长期记忆（/memory_add, /memory_list, /memory_del, /memory_clear）
+	- 作用域钉住内容（/pin, /pins, /unpin）
+	- 结构化摘要（conversation_summaries）
+	- 向量检索回注（message_embeddings）
 - 作业系统：
 	- summarize（总结）
 	- rename_topic（改名）
@@ -77,8 +83,8 @@ Copy-Item .env.example .env
 至少需要配置：
 
 - TELEGRAM_BOT_TOKEN
-- TELEGRAM_ALLOWED_CHAT_IDS（可选，逗号分隔）
-- TELEGRAM_ALLOWED_USER_IDS（可选，逗号分隔；这些用户总是允许使用）
+- TELEGRAM_ALLOWED_CHAT_IDS（可选，逗号分隔；白名单群内成员可直接使用）
+- TELEGRAM_ALLOWED_USER_IDS（可选，逗号分隔；私聊白名单用户）
 
 建议配置（OpenAI 兼容）：
 
@@ -135,30 +141,57 @@ python -m src.main
 - 工具意图关键词 -> tool 模型
 - 其余 -> simple 模型
 
-### 7. 命令与按钮
+### 7. 鉴权规则
+
+- 群聊：若群在 TELEGRAM_ALLOWED_CHAT_IDS 内，则群成员可直接使用 AI。
+- 私聊：仅 TELEGRAM_ALLOWED_USER_IDS 中的用户可使用。
+- 兜底：若未配置群白名单，仍可使用用户白名单放行。
+
+### 8. 命令与按钮
 
 命令：
 
 - /start：启动提示
-- /new：Topic 会话初始化并弹出模型按钮
+- /help：帮助说明
+- /new：
+	- 私聊：清空当前私聊记忆
+	- 群主话题：创建新 Topic
+- /model：仅私聊，切换私聊会话模型
 - /stop：停止当前 Topic 生成
+- /re：引用 AI 消息后刷新
 - /models：列出当前加载模型
+- /search：联网搜索
+- /pin /pins /unpin：管理当前作用域钉住内容
+- /memory_add /memory_list /memory_del /memory_clear：管理私聊长期记忆
+- /ping：检测模型可用性
 
 按钮：
 
 - Model 按钮：切换会话模型（持久化）
 - Stop：停止生成
 - Summarize：入队总结作业
-- Clear：清空 Topic 上下文（软删除）
+- Rename Topic：入队改名作业
 
-### 8. 数据一致性说明
+### 9. 上下文与作用域
+
+- 私聊作用域：private:{user_id}
+- 话题作用域：topic:{chat_id}:{message_thread_id}
+- 每次请求按顺序拼装：
+	- system 指令
+	- 作用域摘要
+	- 作用域钉住
+	- 私聊长期记忆（仅私聊）
+	- 向量检索历史
+	- 最近原文消息
+
+### 10. 数据一致性说明
 
 - topic_id 由 chat_id + message_thread_id 表示
 - 每 Topic 串行锁，避免并发写冲突
 - 消息保存 telegram_message_id 与内部消息映射
 - 删除消息时进行上下文删除同步，并可通过作业补偿
 
-### 9. 作业系统
+### 11. 作业系统
 
 后台 worker 与 bot 同进程运行，周期拉取 pending 作业：
 
@@ -168,7 +201,7 @@ python -m src.main
 
 失败任务会重试，超过阈值标记 error。
 
-### 10. Tool 调用（当前）
+### 12. Tool 调用（当前）
 
 已提供轻量协议（用于验证工具环路）：
 
@@ -176,6 +209,7 @@ python -m src.main
 - [tool:time_now]
 - [tool:web_search] 关键词
 - [tool:search] 关键词 | 5
+- memory_add（function-calling 工具）：AI 可将稳定偏好/关键约束写入记忆
 
 后续可升级为完整 function-calling schema/tool-loop。
 
@@ -185,7 +219,7 @@ python -m src.main
 - 结果会返回标题、链接和摘要
 - max_results 范围为 1-10，默认 5
 
-### 11. 常见问题
+### 13. 常见问题
 
 1) 没有流式输出
 
@@ -200,7 +234,7 @@ python -m src.main
 
 - 机器人可能无编辑话题权限，数据库标题仍会更新
 
-### 12. 开发建议
+### 14. 开发建议
 
 - 先用 /models 验证模型目录加载
 - 先在单一 Topic 压测 stop 与流式，再扩展并发 Topic
@@ -258,9 +292,16 @@ Each model defines:
 ### 4. Commands
 
 - /start
+- /help
 - /new
+- /model (private only)
 - /stop
+- /re
 - /models
+- /search
+- /pin /pins /unpin
+- /memory_add /memory_list /memory_del /memory_clear
+- /ping
 
 ### 5. Job Worker
 
