@@ -61,6 +61,11 @@ async def _safe_edit_markdown(
             try:
                 await message.edit_text(text, reply_markup=keyboard)
                 return
+            except TelegramRetryAfter as fallback_retry_exc:
+                if retry_on_flood and flood_attempt < max_flood_attempts - 1:
+                    await asyncio.sleep(fallback_retry_exc.retry_after)
+                    continue
+                return
             except TelegramBadRequest as fallback_exc:
                 fallback_text = str(fallback_exc).lower()
                 if "message is not modified" in fallback_text:
