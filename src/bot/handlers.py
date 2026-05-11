@@ -158,7 +158,7 @@ async def _send_tail_as_txt(message: Message, topic_key: TopicKey, tail_text: st
 async def _send_refreshed_content(message: Message, topic_key: TopicKey, full_text: str) -> None:
     preview, overflow = _split_preview_and_tail(full_text)
     if overflow:
-        preview_text = _truncate_with_dynamic_omission(full_text, PREVIEW_CHARS_ON_OVERFLOW, "内容过长，剩余内容见txt附件")
+        preview_text = _truncate_with_dynamic_omission(full_text, PREVIEW_CHARS_ON_OVERFLOW, "消息较长，已经放入txt请查看txt文件")
         preview_msg = await message.answer(preview_text, reply_markup=control_keyboard())
         from src.bot import runtime
         runtime.assistant_full_text_by_message[(topic_key.chat_id, preview_msg.message_id)] = full_text
@@ -821,8 +821,9 @@ async def _run_generation(
         runtime.active_stream_snapshots.pop(topic_key.value, None)
         return
 
-    if len(final_render) > TELEGRAM_RENDER_LIMIT:
-        preview_body = _truncate_with_dynamic_omission(final_text, PREVIEW_CHARS_ON_OVERFLOW, "内容过长，剩余内容见txt附件")
+    preview, overflow = _split_preview_and_tail(final_text)
+    if overflow:
+        preview_body = _truncate_with_dynamic_omission(final_text, PREVIEW_CHARS_ON_OVERFLOW, "消息较长，已经放入txt请查看txt文件")
         short_render = header + stats_text + preview_body
         await _safe_edit_markdown(sent, short_render, retry_on_flood=True, reply_markup=active_reply_markup)
         await _send_tail_as_txt(message, topic_key, final_text)
