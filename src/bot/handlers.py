@@ -736,13 +736,6 @@ async def _run_generation(
     final_render = header + stats_text + final_text
     if _taken_over_by_user():
         runtime.active_stream_snapshots.pop(topic_key.value, None)
-        session_manager.save_streaming_checkpoint(
-            key=topic_key,
-            assistant_telegram_message_id=sent.message_id,
-            partial_content=final_text,
-            partial_reasoning=reasoning,
-            stop_reason="user_takeover",
-        )
         return
 
     if len(final_render) > TELEGRAM_RENDER_LIMIT:
