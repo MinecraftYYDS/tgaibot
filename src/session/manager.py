@@ -181,6 +181,23 @@ class TopicSessionManager:
                 lines.append(f"{role}: {item.content}")
             return "\n".join(lines)
 
+    def get_latest_assistant_content(self, key: TopicKey) -> str:
+        with topic_transaction(key.value) as db:
+            topic = self._fetch_topic_for_update(db, key)
+            stmt = (
+                select(Message)
+                .where(
+                    Message.topic_id == topic.id,
+                    Message.deleted.is_(False),
+                    Message.role == "assistant",
+                )
+                .order_by(asc(Message.id))
+            )
+            items = db.execute(stmt).scalars().all()
+            if not items:
+                return ""
+            return str(items[-1].content or "")
+
     def enqueue_job(self, key: TopicKey, job_type: str, payload: dict[str, object]) -> int:
         with topic_transaction(key.value) as db:
             topic = self._fetch_topic_for_update(db, key)

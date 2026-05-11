@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 from time import monotonic
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command
-from aiogram.types import BusinessMessagesDeleted, InlineKeyboardMarkup, Message
+from aiogram.types import BufferedInputFile, BusinessMessagesDeleted, InlineKeyboardMarkup, Message
 
 from src.bot.keyboards import control_keyboard, model_selection_keyboard, stop_only_keyboard
 from src.bot.runtime import generation_control, model_router, provider, session_manager
@@ -19,6 +20,9 @@ from src.session.manager import TopicKey
 
 logger = logging.getLogger(__name__)
 router = Router(name="handlers")
+
+TELEGRAM_RENDER_LIMIT = 3500
+PREVIEW_CHARS_ON_OVERFLOW = 1800
 
 
 async def _safe_edit_markdown(
@@ -48,13 +52,22 @@ async def _safe_edit_markdown(
             error_text = str(exc).lower()
             if "message is not modified" in error_text:
                 return
+            if "message_too_long" in error_text:
+                return
+            if "message to edit not found" in error_text or "message can't be edited" in error_text:
+                return
             if "parse entities" not in error_text:
                 raise
             try:
                 await message.edit_text(text, reply_markup=keyboard)
                 return
             except TelegramBadRequest as fallback_exc:
-                if "message is not modified" in str(fallback_exc).lower():
+                fallback_text = str(fallback_exc).lower()
+                if "message is not modified" in fallback_text:
+                    return
+                if "message_too_long" in fallback_text:
+                    return
+                if "message to edit not found" in fallback_text or "message can't be edited" in fallback_text:
                     return
                 raise
 
@@ -100,6 +113,28 @@ def _split_telegram_text(text: str, limit: int = 3500) -> list[str]:
         parts.append(text[start:split_at].strip())
         start = split_at
     return [p for p in parts if p]
+
+
+def _clip_stream_render(text: str) -> str:
+    if len(text) <= TELEGRAM_RENDER_LIMIT:
+        return text
+    suffix = "\n\n...(消息较长，仍在生成中)"
+    max_main = max(0, TELEGRAM_RENDER_LIMIT - len(suffix))
+    return text[:max_main] + suffix
+
+
+def _split_preview_and_tail(text: str, head_chars: int = PREVIEW_CHARS_ON_OVERFLOW) -> tuple[str, str]:
+    if len(text) <= head_chars:
+        return text, ""
+    return text[:head_chars], text[head_chars:]
+
+
+async def _send_tail_as_txt(message: Message, topic_key: TopicKey, tail_text: str) -> None:
+    if not tail_text:
+        return
+    file_name = f"ai_reply_full_{topic_key.message_thread_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.txt"
+    payload = BufferedInputFile(tail_text.encode("utf-8"), filename=file_name)
+    await message.answer_document(payload, caption="📎 完整内容（txt）")
 
 
 async def _cleanup_new_topic_seed_messages(topic_key: TopicKey) -> None:
@@ -485,7 +520,15 @@ async def _run_generation(
     context_message_limit: int | None = None,
     reply_markup: InlineKeyboardMarkup | None = None,
 ) -> None:
+    from src.bot import runtime
+
+    runtime.user_takeover_topics.discard(topic_key.value)
+
+    def _taken_over_by_user() -> bool:
+        return topic_key.value in runtime.user_takeover_topics
+
     active_reply_markup = reply_markup if reply_markup is not None else control_keyboard()
+    is_topic_controls = reply_markup is None
     started_at = monotonic()
     header = f"🤖 模型: {route.model}\n📋 原因: {route.reason}\n\n"
     try:
@@ -503,6 +546,14 @@ async def _run_generation(
     context_text = session_manager.collect_context_for_response(topic_key, max_messages=context_message_limit)
     generation_control.begin(topic_key.value)
 
+    runtime.active_stream_snapshots[topic_key.value] = runtime.ActiveStreamSnapshot(
+        chat_id=message.chat.id,
+        message_thread_id=topic_key.message_thread_id,
+        assistant_message_id=sent.message_id,
+        latest_render_text=header + f"⏳ 思考中... {_format_elapsed(monotonic() - started_at)}",
+        is_topic_controls=is_topic_controls,
+    )
+
     tool_status = ""
     tool_call_count = 0
 
@@ -511,7 +562,7 @@ async def _run_generation(
         if tool_status:
             parts.append(tool_status + "\n\n")
         parts.append(built_answer or f"⏳ 思考中... {_format_elapsed(monotonic() - started_at)}")
-        return "".join(parts)
+        return _clip_stream_render("".join(parts))
 
     async def _tool_event_to_chat(event: str) -> None:
         nonlocal tool_status, tool_call_count
@@ -533,7 +584,13 @@ async def _run_generation(
                 tool_status = "🛠️ 正在抓取网页内容..."
             else:
                 tool_status = f"🛠️ 正在调用工具：{tool_name}"
-            await _safe_edit_markdown(sent, _current_stream_render(), reply_markup=active_reply_markup)
+            current = _current_stream_render()
+            snapshot = runtime.active_stream_snapshots.get(topic_key.value)
+            if snapshot is not None:
+                snapshot.latest_render_text = current
+            if _taken_over_by_user():
+                return
+            await _safe_edit_markdown(sent, current, reply_markup=active_reply_markup)
         elif action == "done":
             if tool_name == "search":
                 if display_query:
@@ -546,7 +603,13 @@ async def _run_generation(
                 tool_status = "✅ 工具调用完成，正在生成最终回答..."
             else:
                 tool_status = f"✅ 工具 {tool_name} 调用完成，正在生成最终回答..."
-            await _safe_edit_markdown(sent, _current_stream_render(), reply_markup=active_reply_markup)
+            current = _current_stream_render()
+            snapshot = runtime.active_stream_snapshots.get(topic_key.value)
+            if snapshot is not None:
+                snapshot.latest_render_text = current
+            if _taken_over_by_user():
+                return
+            await _safe_edit_markdown(sent, current, reply_markup=active_reply_markup)
 
     last_edit = monotonic()
     built_answer = ""
@@ -563,7 +626,13 @@ async def _run_generation(
                 pass
             if thinking_timer_stop.is_set() or built_answer:
                 break
-            await _safe_edit_markdown(sent, _current_stream_render(), reply_markup=active_reply_markup)
+            current = _current_stream_render()
+            snapshot = runtime.active_stream_snapshots.get(topic_key.value)
+            if snapshot is not None:
+                snapshot.latest_render_text = current
+            if _taken_over_by_user():
+                break
+            await _safe_edit_markdown(sent, current, reply_markup=active_reply_markup)
 
     thinking_timer_task = asyncio.create_task(_thinking_timer_loop())
     try:
@@ -578,10 +647,20 @@ async def _run_generation(
             if generation_control.should_stop(topic_key.value):
                 stop_reason = "user_stop"
                 break
+            if _taken_over_by_user():
+                stop_reason = "user_takeover"
+                break
             built_answer += chunk
             now = monotonic()
             if now - last_edit >= settings.stream_edit_interval_seconds:
-                await _safe_edit_markdown(sent, _current_stream_render(), reply_markup=active_reply_markup)
+                current = _current_stream_render()
+                snapshot = runtime.active_stream_snapshots.get(topic_key.value)
+                if snapshot is not None:
+                    snapshot.latest_render_text = current
+                if _taken_over_by_user():
+                    stop_reason = "user_takeover"
+                    break
+                await _safe_edit_markdown(sent, current, reply_markup=active_reply_markup)
                 last_edit = now
     except Exception as exc:  # noqa: BLE001
         err_text = str(exc)
@@ -617,10 +696,20 @@ async def _run_generation(
                     if generation_control.should_stop(topic_key.value):
                         stop_reason = "user_stop"
                         break
+                    if _taken_over_by_user():
+                        stop_reason = "user_takeover"
+                        break
                     built_answer += chunk
                     now = monotonic()
                     if now - last_edit >= settings.stream_edit_interval_seconds:
-                        await _safe_edit_markdown(sent, _current_stream_render(), reply_markup=active_reply_markup)
+                        current = _current_stream_render()
+                        snapshot = runtime.active_stream_snapshots.get(topic_key.value)
+                        if snapshot is not None:
+                            snapshot.latest_render_text = current
+                        if _taken_over_by_user():
+                            stop_reason = "user_takeover"
+                            break
+                        await _safe_edit_markdown(sent, current, reply_markup=active_reply_markup)
                         last_edit = now
             except Exception as fallback_exc:  # noqa: BLE001
                 stop_reason = "error"
@@ -645,8 +734,27 @@ async def _run_generation(
     total_elapsed = _format_elapsed(monotonic() - started_at)
     stats_text = f"⌛️ 用时：{total_elapsed}\n⚒️ 调用工具：{tool_call_count} 次\n\n"
     final_render = header + stats_text + final_text
+    if _taken_over_by_user():
+        runtime.active_stream_snapshots.pop(topic_key.value, None)
+        session_manager.save_streaming_checkpoint(
+            key=topic_key,
+            assistant_telegram_message_id=sent.message_id,
+            partial_content=final_text,
+            partial_reasoning=reasoning,
+            stop_reason="user_takeover",
+        )
+        return
 
-    await _safe_edit_markdown(sent, final_render, retry_on_flood=True, reply_markup=active_reply_markup)
+    if len(final_render) > TELEGRAM_RENDER_LIMIT:
+        preview, _overflow = _split_preview_and_tail(final_text)
+        short_render = header + stats_text + preview + "\n\n...(内容过长，剩余内容见txt附件)"
+        await _safe_edit_markdown(sent, short_render, retry_on_flood=True, reply_markup=active_reply_markup)
+        await _send_tail_as_txt(message, topic_key, final_text)
+    else:
+        await _safe_edit_markdown(sent, final_render, retry_on_flood=True, reply_markup=active_reply_markup)
+
+    runtime.active_stream_snapshots.pop(topic_key.value, None)
+    runtime.user_takeover_topics.discard(topic_key.value)
     session_manager.append_message(
         key=topic_key,
         telegram_message_id=sent.message_id,
