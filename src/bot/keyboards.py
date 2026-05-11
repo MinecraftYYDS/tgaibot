@@ -5,15 +5,23 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from src.config import settings
 
 
+def _styled_button(text: str, callback_data: str, style: str) -> InlineKeyboardButton:
+    try:
+        return InlineKeyboardButton(text=text, callback_data=callback_data, style=style)  # type: ignore[call-arg]
+    except (TypeError, ValueError):
+        return InlineKeyboardButton(text=text, callback_data=callback_data)
+
+
 def model_selection_keyboard() -> InlineKeyboardMarkup:
     from src.bot.runtime import failed_ping_models  # local import to avoid circular dep
 
-    rows: list[list[InlineKeyboardButton]] = [[InlineKeyboardButton(text="自动路由", callback_data="model:auto")]]
+    rows: list[list[InlineKeyboardButton]] = [[_styled_button(text="自动路由", callback_data="model:auto", style="primary")]]
     for model in settings.model_catalog:
         if "tts" in model.tags:
             continue
-        label = f"{model.label} (暂不可用)" if model.id in failed_ping_models else model.label
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"model:{model.id}")])
+        failed = model.id in failed_ping_models
+        label = f"{model.label} (暂不可用)" if failed else model.label
+        rows.append([_styled_button(text=label, callback_data=f"model:{model.id}", style="danger" if failed else "success")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
