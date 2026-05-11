@@ -12,7 +12,7 @@ def model_selection_keyboard() -> InlineKeyboardMarkup:
     for model in settings.model_catalog:
         if "tts" in model.tags:
             continue
-        label = f"{model.label} (不可用)" if model.id in failed_ping_models else model.label
+        label = f"{model.label} (暂不可用)" if model.id in failed_ping_models else model.label
         rows.append([InlineKeyboardButton(text=label, callback_data=f"model:{model.id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
