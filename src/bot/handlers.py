@@ -223,7 +223,9 @@ async def _ping_single_model(model_id: str, timeout: float = 30.0) -> bool:
 
         response = await asyncio.wait_for(_collect(), timeout=timeout)
         stripped = response.strip()
-        # A response starting with "[model=" means the provider echoed the prompt (no API key)
+        # Three conditions for a "live" response:
+        # 1. non-empty, 2. not the echo fallback (no API key configured),
+        # 3. not an upstream HTTP error message returned by the provider.
         return bool(stripped) and not stripped.startswith("[model=") and "上游接口请求失败" not in stripped
     except Exception:
         return False
@@ -260,7 +262,9 @@ async def on_ping(message: Message) -> None:
         except (TelegramBadRequest, TelegramRetryAfter):
             pass
 
-    # Update the global failed set used by model_selection_keyboard
+    # Update the global failed set used by model_selection_keyboard.
+    # We import the module (not the name) so the assignment mutates the
+    # actual module-level variable rather than a stale local binding.
     from src.bot import runtime as _rt
     _rt.failed_ping_models = {m_id for m_id, ok in results.items() if ok is False}
 
