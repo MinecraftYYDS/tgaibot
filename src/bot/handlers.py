@@ -14,6 +14,7 @@ from src.bot.runtime import generation_control, model_router, provider, session_
 from src.config import settings
 from src.llm.reasoning import post_process_reasoning
 from src.llm.tools import execute_builtin_tool
+from src.routing.router import RouteResult
 from src.session.manager import TopicKey
 
 logger = logging.getLogger(__name__)
@@ -299,8 +300,84 @@ async def on_text(message: Message) -> None:
     requested_mode = selected_model if mode == "manual" and selected_model else settings.default_model_mode
     route = model_router.route(incoming_text, mode=requested_mode)
 
-    prompt_for_model = incoming_text
+    await _run_generation(
+        message=message,
+        topic_key=topic_key,
+        prompt_for_model=incoming_text,
+        route=route,
+    )
 
+
+@router.message(F.photo)
+async def on_photo(message: Message) -> None:
+    if message.message_thread_id is None or message.message_thread_id == 0:
+        await message.answer("⚠️ 请在论坛话题内聊天")
+        return
+    user_id = message.from_user.id if message.from_user else None
+    is_allowed_user = user_id in settings.allowed_user_ids if user_id is not None else False
+    if settings.allowed_chat_ids and message.chat.id not in settings.allowed_chat_ids and not is_allowed_user:
+        await message.answer("❌ 此群组未被授权使用此机器人")
+        return
+
+    caption = (message.caption or "").strip()
+    # Use caption as the prompt text; fall back to a generic placeholder.
+    prompt_text = caption if caption else "请描述这张图片"
+
+    topic_key = TopicKey(chat_id=message.chat.id, message_thread_id=message.message_thread_id)
+    session_manager.get_or_create_topic(topic_key)
+    # Store the caption (or placeholder) as the user message in history.
+    session_manager.append_message(
+        key=topic_key,
+        telegram_message_id=message.message_id,
+        role="user",
+        content=f"[图片] {prompt_text}",
+    )
+
+    # Download the highest-resolution photo available.
+    photo = message.photo[-1]
+    image_bytes: bytes | None = None
+    image_mime_type = "image/jpeg"
+    try:
+        file = await message.bot.get_file(photo.file_id)
+        downloaded = await message.bot.download_file(file.file_path)
+        raw = downloaded.read() if downloaded is not None else None
+        if raw:
+            image_bytes = raw
+            # Detect MIME type from file extension (Telegram usually serves JPEG).
+            path_lower = (file.file_path or "").lower()
+            if path_lower.endswith(".png"):
+                image_mime_type = "image/png"
+            elif path_lower.endswith(".webp"):
+                image_mime_type = "image/webp"
+            else:
+                image_mime_type = "image/jpeg"
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to download photo: %s", exc)
+        await message.answer("⚠️ 图片下载失败，将仅使用文字内容回复")
+
+    mode, selected_model = session_manager.get_topic_model_selection(topic_key)
+    requested_mode = selected_model if mode == "manual" and selected_model else settings.default_model_mode
+    # Route based on caption; default to the vision-capable simple model.
+    route = model_router.route(prompt_text, mode=requested_mode)
+
+    await _run_generation(
+        message=message,
+        topic_key=topic_key,
+        prompt_for_model=prompt_text,
+        route=route,
+        image_bytes=image_bytes,
+        image_mime_type=image_mime_type,
+    )
+
+
+async def _run_generation(
+    message: Message,
+    topic_key: TopicKey,
+    prompt_for_model: str,
+    route: RouteResult,
+    image_bytes: bytes | None = None,
+    image_mime_type: str = "image/jpeg",
+) -> None:
     started_at = monotonic()
     header = f"🤖 模型: {route.model}\n📋 原因: {route.reason}\n\n"
     try:
@@ -383,6 +460,8 @@ async def on_text(message: Message) -> None:
             model=route.model,
             context_messages=context_text,
             on_tool_event=_tool_event_to_chat,
+            image_bytes=image_bytes,
+            image_mime_type=image_mime_type,
         ):
             if generation_control.should_stop(topic_key.value):
                 stop_reason = "user_stop"
@@ -420,6 +499,8 @@ async def on_text(message: Message) -> None:
                     model=fallback_model,
                     context_messages=context_text,
                     on_tool_event=_tool_event_to_chat,
+                    image_bytes=image_bytes,
+                    image_mime_type=image_mime_type,
                 ):
                     if generation_control.should_stop(topic_key.value):
                         stop_reason = "user_stop"

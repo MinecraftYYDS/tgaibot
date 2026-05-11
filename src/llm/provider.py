@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -36,6 +37,8 @@ class LLMProvider:
         model: str,
         context_messages: list[dict] | None = None,
         on_tool_event: Callable[[str], Awaitable[None]] | None = None,
+        image_bytes: bytes | None = None,
+        image_mime_type: str = "image/jpeg",
     ) -> AsyncIterator[str]:
         tool_intent = try_extract_tool_intent(prompt)
         if tool_intent is not None:
@@ -58,6 +61,8 @@ class LLMProvider:
                     api_key=api_key,
                     context_messages=context_messages or [],
                     on_tool_event=on_tool_event,
+                    image_bytes=image_bytes,
+                    image_mime_type=image_mime_type,
                 )
                 for chunk in self._chunk_text(final_text):
                     yield chunk
@@ -72,6 +77,8 @@ class LLMProvider:
                 api_key=self._pick_from_pool(settings.openai_key_pool, "OPENAI_API_KEYS"),
                 context_messages=context_messages or [],
                 on_tool_event=on_tool_event,
+                image_bytes=image_bytes,
+                image_mime_type=image_mime_type,
             )
             for chunk in self._chunk_text(final_text):
                 yield chunk
@@ -98,6 +105,8 @@ class LLMProvider:
         context_messages: list[dict] | None = None,
         max_iterations: int = 5,
         on_tool_event: Callable[[str], Awaitable[None]] | None = None,
+        image_bytes: bytes | None = None,
+        image_mime_type: str = "image/jpeg",
     ) -> str:
         messages: list[dict] = [
             {"role": "system", "content": "你是一个有帮助的AI助手。请用中文回答用户的问题。尽可能简洁、准确、有用。"},
@@ -113,7 +122,16 @@ class LLMProvider:
                         if reasoning_content:
                             packed["reasoning_content"] = reasoning_content
                     messages.append(packed)
-        messages.append({"role": "user", "content": prompt})
+
+        if image_bytes:
+            b64 = base64.b64encode(image_bytes).decode("ascii")
+            user_content: object = [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:{image_mime_type};base64,{b64}"}},
+            ]
+        else:
+            user_content = prompt
+        messages.append({"role": "user", "content": user_content})
 
         tools = [
             {
