@@ -591,6 +591,52 @@ async def on_memory_list(message: Message) -> None:
     await message.answer("\n".join(lines))
 
 
+@router.message(Command("memory_del"))
+async def on_memory_del(message: Message) -> None:
+    if not await _ensure_ai_permission(message):
+        return
+    if not _is_private_chat(message):
+        await message.answer("⚠️ /memory_del 仅支持私聊")
+        return
+    private_key = _private_topic_key_from_message(message)
+    if private_key is None:
+        await message.answer("❌ 无法识别用户身份")
+        return
+
+    raw = (message.text or "").strip()
+    arg = _extract_command_argument(raw, "memory_del")
+    if not arg:
+        await message.answer("🧠 用法：/memory_del 记忆ID")
+        return
+    try:
+        memory_id = int(arg)
+    except ValueError:
+        await message.answer("⚠️ 记忆ID 必须是数字")
+        return
+
+    ok = session_manager.remove_long_term_memory(user_id=private_key.chat_id, memory_id=memory_id)
+    if not ok:
+        await message.answer("⚠️ 未找到该记忆ID")
+        return
+    await message.answer(f"✅ 已删除长期记忆（ID: {memory_id}）")
+
+
+@router.message(Command("memory_clear"))
+async def on_memory_clear(message: Message) -> None:
+    if not await _ensure_ai_permission(message):
+        return
+    if not _is_private_chat(message):
+        await message.answer("⚠️ /memory_clear 仅支持私聊")
+        return
+    private_key = _private_topic_key_from_message(message)
+    if private_key is None:
+        await message.answer("❌ 无法识别用户身份")
+        return
+
+    deleted = session_manager.clear_long_term_memories(user_id=private_key.chat_id)
+    await message.answer(f"🧹 已清空长期记忆，共删除 {deleted} 条")
+
+
 # ---------------------------------------------------------------------------
 # /ping helpers
 # ---------------------------------------------------------------------------
@@ -871,6 +917,8 @@ async def _run_generation(
         topic_key,
         max_messages=context_message_limit,
         recent_window_size=settings.recent_window_size,
+        query_text=prompt_for_model,
+        retrieval_top_k=settings.retrieval_top_k,
     )
     generation_control.begin(topic_key.value)
 

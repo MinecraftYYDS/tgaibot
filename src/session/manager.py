@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
+import math
+import re
 
 from sqlalchemy import asc, func, select
 
+from src.config import settings
 from src.persistence.models import (
     ConversationSummary,
     Job,
@@ -31,6 +35,33 @@ class TopicKey:
 
 
 class TopicSessionManager:
+    @staticmethod
+    def _tokenize_for_embedding(text: str) -> list[str]:
+        lowered = (text or "").lower()
+        return re.findall("[A-Za-z0-9_]+|[\u4e00-\u9fff]+", lowered)
+
+    @staticmethod
+    def _text_to_embedding(text: str, dim: int = 64) -> list[float]:
+        vec = [0.0] * dim
+        tokens = TopicSessionManager._tokenize_for_embedding(text)
+        if not tokens:
+            return vec
+        for tok in tokens:
+            digest = hashlib.md5(tok.encode("utf-8")).digest()
+            idx = int.from_bytes(digest[:4], "little", signed=False) % dim
+            vec[idx] += 1.0
+        norm = math.sqrt(sum(v * v for v in vec))
+        if norm <= 0:
+            return vec
+        return [v / norm for v in vec]
+
+    @staticmethod
+    def _cosine_similarity(a: list[float], b: list[float]) -> float:
+        if not a or not b:
+            return 0.0
+        size = min(len(a), len(b))
+        return float(sum(a[i] * b[i] for i in range(size)))
+
     @staticmethod
     def _scope_for_key(key: TopicKey) -> tuple[str, str]:
         if key.chat_id > 0 and key.message_thread_id == 0:
@@ -70,6 +101,18 @@ class TopicSessionManager:
             )
             db.add(message)
             db.flush()
+            if settings.embedding_enable and content.strip():
+                scope_type, scope_id = self._scope_for_key(key)
+                vec = self._text_to_embedding(content)
+                db.add(
+                    MessageEmbedding(
+                        scope_type=scope_type,
+                        scope_id=scope_id,
+                        message_id=int(message.id),
+                        content=content,
+                        embedding_json=json.dumps(vec, ensure_ascii=True),
+                    )
+                )
             db.refresh(message)
             return message
 
@@ -86,6 +129,15 @@ class TopicSessionManager:
                 return False
             message.deleted = True
             db.add(message)
+            scope_type, scope_id = self._scope_for_key(key)
+            emb_stmt = select(MessageEmbedding).where(
+                MessageEmbedding.scope_type == scope_type,
+                MessageEmbedding.scope_id == scope_id,
+                MessageEmbedding.message_id == int(message.id),
+            )
+            emb_rows = db.execute(emb_stmt).scalars().all()
+            for row in emb_rows:
+                db.delete(row)
             return True
 
     def get_topic_model_selection(self, key: TopicKey) -> tuple[str, str]:
@@ -365,15 +417,40 @@ class TopicSessionManager:
             )
             return list(db.execute(stmt).scalars().all())
 
+    def remove_long_term_memory(self, user_id: int, memory_id: int) -> bool:
+        key = TopicKey(chat_id=user_id, message_thread_id=0)
+        with topic_transaction(key.value) as db:
+            stmt = select(LongTermMemory).where(
+                LongTermMemory.id == memory_id,
+                LongTermMemory.user_id == user_id,
+            )
+            row = db.execute(stmt).scalar_one_or_none()
+            if row is None:
+                return False
+            db.delete(row)
+            return True
+
+    def clear_long_term_memories(self, user_id: int) -> int:
+        key = TopicKey(chat_id=user_id, message_thread_id=0)
+        with topic_transaction(key.value) as db:
+            stmt = select(LongTermMemory).where(LongTermMemory.user_id == user_id)
+            rows = db.execute(stmt).scalars().all()
+            for row in rows:
+                db.delete(row)
+            return len(rows)
+
     def collect_augmented_context_for_response(
         self,
         key: TopicKey,
         max_messages: int | None = None,
         recent_window_size: int = 10,
+        query_text: str = "",
+        retrieval_top_k: int = 6,
     ) -> list[dict]:
         scope_type, scope_id = self._scope_for_key(key)
         with topic_transaction(key.value) as db:
             topic = self._fetch_topic_for_update(db, key)
+            limit_value = max_messages if (max_messages is not None and max_messages > 0) else max(1, int(recent_window_size))
 
             context: list[dict] = []
 
@@ -417,16 +494,62 @@ class TopicSessionManager:
                     if long_text:
                         context.append({"role": "system", "content": "[长期记忆]\n" + long_text})
 
-            stmt = (
+            msg_stmt = (
                 select(Message)
                 .where(Message.topic_id == topic.id, Message.deleted.is_(False))
                 .order_by(asc(Message.id))
             )
-            items = db.execute(stmt).scalars().all()
-            limit_value = max_messages if (max_messages is not None and max_messages > 0) else max(1, int(recent_window_size))
-            items = items[-limit_value:]
+            all_items = db.execute(msg_stmt).scalars().all()
+            recent_items = all_items[-limit_value:]
+            recent_message_ids = {int(item.id) for item in recent_items}
 
-            for item in items:
+            if settings.embedding_enable and query_text.strip() and retrieval_top_k > 0:
+                query_vec = self._text_to_embedding(query_text)
+                emb_stmt = (
+                    select(MessageEmbedding)
+                    .where(MessageEmbedding.scope_type == scope_type, MessageEmbedding.scope_id == scope_id)
+                    .order_by(MessageEmbedding.id.desc())
+                    .limit(400)
+                )
+                emb_items = db.execute(emb_stmt).scalars().all()
+                scored: list[tuple[float, str]] = []
+                for emb in emb_items:
+                    if int(emb.message_id or 0) in recent_message_ids:
+                        continue
+                    raw = str(emb.embedding_json or "[]")
+                    try:
+                        vec_raw = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(vec_raw, list):
+                        continue
+                    try:
+                        vec = [float(v) for v in vec_raw]
+                    except (TypeError, ValueError):
+                        continue
+                    sim = self._cosine_similarity(query_vec, vec)
+                    if sim <= 0.12:
+                        continue
+                    snippet = str(emb.content or "").strip()
+                    if not snippet:
+                        continue
+                    scored.append((sim, snippet))
+                scored.sort(key=lambda x: x[0], reverse=True)
+                seen: set[str] = set()
+                picked: list[str] = []
+                for _, text in scored:
+                    key_text = text[:120]
+                    if key_text in seen:
+                        continue
+                    seen.add(key_text)
+                    picked.append(text)
+                    if len(picked) >= retrieval_top_k:
+                        break
+                if picked:
+                    retrieve_text = "\n".join(f"- {item}" for item in picked)
+                    context.append({"role": "system", "content": "[相关历史检索]\n" + retrieve_text})
+
+            for item in recent_items:
                 msg = {
                     "role": "assistant" if item.role == "assistant" else "user",
                     "content": item.content,
