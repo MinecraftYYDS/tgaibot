@@ -112,6 +112,13 @@ def _private_topic_key_from_message(message: Message) -> TopicKey | None:
     return TopicKey(chat_id=user_id, message_thread_id=0)
 
 
+def _scope_topic_key_from_message(message: Message) -> TopicKey | None:
+    if _is_private_chat(message):
+        return _private_topic_key_from_message(message)
+    thread_id = message.message_thread_id if message.message_thread_id is not None else 0
+    return TopicKey(chat_id=message.chat.id, message_thread_id=thread_id)
+
+
 async def _ensure_ai_permission(message: Message) -> bool:
     is_private = message.chat.type == "private"
     user_id = message.from_user.id if message.from_user else None
@@ -132,8 +139,7 @@ async def _ensure_ai_permission(message: Message) -> bool:
         await message.answer("❌ 此群组未被授权使用此机器人")
     else:
         await message.answer("❌ 无权限使用 AI（请配置 TELEGRAM_ALLOWED_CHAT_IDS 或 TELEGRAM_ALLOWED_USER_IDS）")
-        return False
-    return True
+    return False
 
 
 def _is_private_chat(message: Message) -> bool:
@@ -470,6 +476,121 @@ async def on_search(message: Message) -> None:
         await message.answer(prefix + part)
 
 
+@router.message(Command("pin"))
+async def on_pin(message: Message) -> None:
+    if not await _ensure_ai_permission(message):
+        return
+    raw = (message.text or "").strip()
+    content = _extract_command_argument(raw, "pin")
+    if not content:
+        await message.answer("📌 用法：/pin 要钉住的内容")
+        return
+    key = _scope_topic_key_from_message(message)
+    if key is None:
+        await message.answer("❌ 无法识别当前会话作用域")
+        return
+    session_manager.get_or_create_topic(key)
+    user_id = message.from_user.id if message.from_user else 0
+    pin_id = session_manager.add_pinned_memory(key=key, content=content, created_by=user_id)
+    if pin_id <= 0:
+        await message.answer("⚠️ 钉住失败，内容为空")
+        return
+    await message.answer(f"✅ 已钉住（ID: {pin_id}）")
+
+
+@router.message(Command("pins"))
+async def on_pins(message: Message) -> None:
+    if not await _ensure_ai_permission(message):
+        return
+    key = _scope_topic_key_from_message(message)
+    if key is None:
+        await message.answer("❌ 无法识别当前会话作用域")
+        return
+    session_manager.get_or_create_topic(key)
+    items = session_manager.list_pinned_memories(key=key, limit=20)
+    if not items:
+        await message.answer("📌 当前会话暂无钉住内容")
+        return
+    lines = ["📌 当前会话钉住内容："]
+    for item in items:
+        lines.append(f"{item.id}. {item.content}")
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("unpin"))
+async def on_unpin(message: Message) -> None:
+    if not await _ensure_ai_permission(message):
+        return
+    raw = (message.text or "").strip()
+    arg = _extract_command_argument(raw, "unpin")
+    if not arg:
+        await message.answer("📌 用法：/unpin 钉住ID")
+        return
+    try:
+        pin_id = int(arg)
+    except ValueError:
+        await message.answer("⚠️ 钉住ID 必须是数字")
+        return
+
+    key = _scope_topic_key_from_message(message)
+    if key is None:
+        await message.answer("❌ 无法识别当前会话作用域")
+        return
+    session_manager.get_or_create_topic(key)
+    ok = session_manager.remove_pinned_memory(key=key, pin_id=pin_id)
+    if not ok:
+        await message.answer("⚠️ 未找到该钉住项，或不属于当前会话")
+        return
+    await message.answer(f"✅ 已取消钉住（ID: {pin_id}）")
+
+
+@router.message(Command("memory_add"))
+async def on_memory_add(message: Message) -> None:
+    if not await _ensure_ai_permission(message):
+        return
+    if not _is_private_chat(message):
+        await message.answer("⚠️ /memory_add 仅支持私聊")
+        return
+    private_key = _private_topic_key_from_message(message)
+    if private_key is None:
+        await message.answer("❌ 无法识别用户身份")
+        return
+
+    raw = (message.text or "").strip()
+    memory_text = _extract_command_argument(raw, "memory_add")
+    if not memory_text:
+        await message.answer("🧠 用法：/memory_add 需要长期记住的偏好或事实")
+        return
+    memory_id = session_manager.add_long_term_memory(user_id=private_key.chat_id, memory=memory_text, importance=1)
+    if memory_id <= 0:
+        await message.answer("⚠️ 保存失败，内容为空")
+        return
+    await message.answer(f"✅ 长期记忆已保存（ID: {memory_id}）")
+
+
+@router.message(Command("memory_list"))
+async def on_memory_list(message: Message) -> None:
+    if not await _ensure_ai_permission(message):
+        return
+    if not _is_private_chat(message):
+        await message.answer("⚠️ /memory_list 仅支持私聊")
+        return
+    private_key = _private_topic_key_from_message(message)
+    if private_key is None:
+        await message.answer("❌ 无法识别用户身份")
+        return
+
+    items = session_manager.list_long_term_memories(user_id=private_key.chat_id, limit=20)
+    if not items:
+        await message.answer("🧠 当前没有长期记忆")
+        return
+
+    lines = ["🧠 当前长期记忆："]
+    for item in items:
+        lines.append(f"{item.id}. [重要度 {item.importance}] {item.memory}")
+    await message.answer("\n".join(lines))
+
+
 # ---------------------------------------------------------------------------
 # /ping helpers
 # ---------------------------------------------------------------------------
@@ -746,7 +867,11 @@ async def _run_generation(
             reply_markup=active_reply_markup,
         )
 
-    context_text = session_manager.collect_context_for_response(topic_key, max_messages=context_message_limit)
+    context_text = session_manager.collect_augmented_context_for_response(
+        topic_key,
+        max_messages=context_message_limit,
+        recent_window_size=settings.recent_window_size,
+    )
     generation_control.begin(topic_key.value)
 
     runtime.active_stream_snapshots[topic_key.value] = runtime.ActiveStreamSnapshot(
@@ -974,6 +1099,21 @@ async def _run_generation(
     msg_count = session_manager.topic_message_count(topic_key)
     if msg_count == 2:
         session_manager.enqueue_job(topic_key, job_type="rename_topic", payload={"source": "auto"})
+
+    estimated_tokens = session_manager.estimate_topic_tokens(topic_key)
+    if (
+        estimated_tokens >= settings.compression_trigger_tokens
+        and msg_count % 6 == 0
+    ):
+        session_manager.enqueue_job(
+            topic_key,
+            job_type="summarize",
+            payload={
+                "source": "auto_compress",
+                "estimated_tokens": estimated_tokens,
+            },
+        )
+
     if stop_reason != "completed":
         session_manager.save_streaming_checkpoint(
             key=topic_key,

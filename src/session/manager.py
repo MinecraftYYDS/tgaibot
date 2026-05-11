@@ -223,6 +223,18 @@ class TopicSessionManager:
             stmt = select(func.count()).select_from(Message).where(Message.topic_id == topic.id, Message.deleted.is_(False))
             return int(db.execute(stmt).scalar_one())
 
+    def estimate_topic_tokens(self, key: TopicKey) -> int:
+        """Estimate token usage with a lightweight chars/4 heuristic."""
+        with topic_transaction(key.value) as db:
+            topic = self._fetch_topic_for_update(db, key)
+            stmt = select(Message).where(Message.topic_id == topic.id, Message.deleted.is_(False))
+            items = db.execute(stmt).scalars().all()
+            total_chars = 0
+            for item in items:
+                total_chars += len(item.content or "")
+                total_chars += len(item.reasoning or "")
+            return max(1, total_chars // 4)
+
     def set_topic_title(self, key: TopicKey, title: str) -> None:
         with topic_transaction(key.value) as db:
             topic = self._fetch_topic_for_update(db, key)
@@ -234,6 +246,195 @@ class TopicSessionManager:
             topic = self._fetch_topic_for_update(db, key)
             topic.summary = summary
             db.add(topic)
+
+    @staticmethod
+    def _summary_json_to_text(raw: str) -> str:
+        payload = (raw or "").strip()
+        if not payload:
+            return ""
+        try:
+            parsed = json.loads(payload)
+        except json.JSONDecodeError:
+            return payload
+        if not isinstance(parsed, dict):
+            return payload
+
+        pieces: list[str] = []
+        main = str(parsed.get("summary") or "").strip()
+        if main:
+            pieces.append(main)
+
+        for key in ("user_goals", "requirements", "decisions", "constraints", "important_details", "open_tasks"):
+            value = parsed.get(key)
+            if isinstance(value, list) and value:
+                line = "、".join(str(item).strip() for item in value if str(item).strip())
+                if line:
+                    pieces.append(f"{key}: {line}")
+        return "\n".join(pieces).strip()
+
+    def set_scope_summary_json(self, key: TopicKey, summary_json: str) -> None:
+        scope_type, scope_id = self._scope_for_key(key)
+        with topic_transaction(key.value) as db:
+            stmt = (
+                select(ConversationSummary)
+                .where(ConversationSummary.scope_type == scope_type, ConversationSummary.scope_id == scope_id)
+                .order_by(ConversationSummary.id.desc())
+                .limit(1)
+            )
+            row = db.execute(stmt).scalar_one_or_none()
+            if row is None:
+                row = ConversationSummary(scope_type=scope_type, scope_id=scope_id, summary_json=summary_json)
+            else:
+                row.summary_json = summary_json
+            db.add(row)
+
+    def get_scope_summary_text(self, key: TopicKey) -> str:
+        scope_type, scope_id = self._scope_for_key(key)
+        with topic_transaction(key.value) as db:
+            topic = self._fetch_topic_for_update(db, key)
+            stmt = (
+                select(ConversationSummary)
+                .where(ConversationSummary.scope_type == scope_type, ConversationSummary.scope_id == scope_id)
+                .order_by(ConversationSummary.id.desc())
+                .limit(1)
+            )
+            row = db.execute(stmt).scalar_one_or_none()
+            if row is not None:
+                text = self._summary_json_to_text(str(row.summary_json or ""))
+                if text:
+                    return text
+            return str(topic.summary or "").strip()
+
+    def add_pinned_memory(self, key: TopicKey, content: str, created_by: int) -> int:
+        scope_type, scope_id = self._scope_for_key(key)
+        clean = content.strip()
+        if not clean:
+            return 0
+        with topic_transaction(key.value) as db:
+            row = PinnedMemory(scope_type=scope_type, scope_id=scope_id, content=clean, created_by=created_by)
+            db.add(row)
+            db.flush()
+            db.refresh(row)
+            return int(row.id)
+
+    def list_pinned_memories(self, key: TopicKey, limit: int = 20) -> list[PinnedMemory]:
+        scope_type, scope_id = self._scope_for_key(key)
+        with topic_transaction(key.value) as db:
+            stmt = (
+                select(PinnedMemory)
+                .where(PinnedMemory.scope_type == scope_type, PinnedMemory.scope_id == scope_id)
+                .order_by(PinnedMemory.id.asc())
+                .limit(limit)
+            )
+            return list(db.execute(stmt).scalars().all())
+
+    def remove_pinned_memory(self, key: TopicKey, pin_id: int) -> bool:
+        scope_type, scope_id = self._scope_for_key(key)
+        with topic_transaction(key.value) as db:
+            stmt = select(PinnedMemory).where(
+                PinnedMemory.id == pin_id,
+                PinnedMemory.scope_type == scope_type,
+                PinnedMemory.scope_id == scope_id,
+            )
+            row = db.execute(stmt).scalar_one_or_none()
+            if row is None:
+                return False
+            db.delete(row)
+            return True
+
+    def add_long_term_memory(self, user_id: int, memory: str, importance: int = 1) -> int:
+        clean = memory.strip()
+        if not clean:
+            return 0
+        key = TopicKey(chat_id=user_id, message_thread_id=0)
+        with topic_transaction(key.value) as db:
+            row = LongTermMemory(user_id=user_id, memory=clean, importance=max(1, int(importance)))
+            db.add(row)
+            db.flush()
+            db.refresh(row)
+            return int(row.id)
+
+    def list_long_term_memories(self, user_id: int, limit: int = 10) -> list[LongTermMemory]:
+        key = TopicKey(chat_id=user_id, message_thread_id=0)
+        with topic_transaction(key.value) as db:
+            stmt = (
+                select(LongTermMemory)
+                .where(LongTermMemory.user_id == user_id)
+                .order_by(LongTermMemory.importance.desc(), LongTermMemory.updated_at.desc(), LongTermMemory.id.desc())
+                .limit(limit)
+            )
+            return list(db.execute(stmt).scalars().all())
+
+    def collect_augmented_context_for_response(
+        self,
+        key: TopicKey,
+        max_messages: int | None = None,
+        recent_window_size: int = 10,
+    ) -> list[dict]:
+        scope_type, scope_id = self._scope_for_key(key)
+        with topic_transaction(key.value) as db:
+            topic = self._fetch_topic_for_update(db, key)
+
+            context: list[dict] = []
+
+            summary_stmt = (
+                select(ConversationSummary)
+                .where(ConversationSummary.scope_type == scope_type, ConversationSummary.scope_id == scope_id)
+                .order_by(ConversationSummary.id.desc())
+                .limit(1)
+            )
+            summary_row = db.execute(summary_stmt).scalar_one_or_none()
+            summary_text = ""
+            if summary_row is not None:
+                summary_text = self._summary_json_to_text(str(summary_row.summary_json or ""))
+            if not summary_text:
+                summary_text = str(topic.summary or "").strip()
+            if summary_text:
+                context.append({"role": "system", "content": "[结构化摘要]\n" + summary_text})
+
+            pinned_stmt = (
+                select(PinnedMemory)
+                .where(PinnedMemory.scope_type == scope_type, PinnedMemory.scope_id == scope_id)
+                .order_by(PinnedMemory.id.asc())
+                .limit(20)
+            )
+            pinned_items = db.execute(pinned_stmt).scalars().all()
+            if pinned_items:
+                pinned_text = "\n".join(f"- {item.content}" for item in pinned_items if item.content.strip())
+                if pinned_text:
+                    context.append({"role": "system", "content": "[钉住内容]\n" + pinned_text})
+
+            if scope_type == "private":
+                long_stmt = (
+                    select(LongTermMemory)
+                    .where(LongTermMemory.user_id == key.chat_id)
+                    .order_by(LongTermMemory.importance.desc(), LongTermMemory.updated_at.desc(), LongTermMemory.id.desc())
+                    .limit(8)
+                )
+                long_items = db.execute(long_stmt).scalars().all()
+                if long_items:
+                    long_text = "\n".join(f"- {item.memory}" for item in long_items if item.memory.strip())
+                    if long_text:
+                        context.append({"role": "system", "content": "[长期记忆]\n" + long_text})
+
+            stmt = (
+                select(Message)
+                .where(Message.topic_id == topic.id, Message.deleted.is_(False))
+                .order_by(asc(Message.id))
+            )
+            items = db.execute(stmt).scalars().all()
+            limit_value = max_messages if (max_messages is not None and max_messages > 0) else max(1, int(recent_window_size))
+            items = items[-limit_value:]
+
+            for item in items:
+                msg = {
+                    "role": "assistant" if item.role == "assistant" else "user",
+                    "content": item.content,
+                }
+                if item.reasoning and item.reasoning.strip():
+                    msg["reasoning_content"] = item.reasoning
+                context.append(msg)
+            return context
 
     def collect_context_for_response(self, key: TopicKey, max_messages: int | None = None) -> list[dict]:
         """Collect conversation history for LLM context.

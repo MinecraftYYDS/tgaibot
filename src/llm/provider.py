@@ -422,7 +422,7 @@ class LLMProvider:
             for msg in context_messages:
                 role = str(msg.get("role") or "").strip()
                 content = str(msg.get("content") or "").strip()
-                if role in {"user", "assistant"} and content:
+                if role in {"system", "user", "assistant"} and content:
                     packed: dict[str, object] = {"role": role, "content": content}
                     if role == "assistant":
                         reasoning_content = str(msg.get("reasoning_content") or "").strip()

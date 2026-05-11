@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 
 from aiogram import Bot
@@ -46,12 +47,37 @@ async def _execute_job(bot: Bot, job_id: int, topic_id: int, job_type: str, payl
             )
             return
         prompt = (
-            "请将以下对话总结为 5 条以内要点，中文输出，保留关键结论和待办。\n\n"
+            "请将以下对话提炼为结构化 JSON，并且只输出 JSON，不要输出任何额外文字。"
+            "JSON schema: "
+            "{\"summary\":string,\"user_goals\":string[],\"requirements\":string[],\"decisions\":string[],"
+            "\"constraints\":string[],\"important_details\":string[],\"open_tasks\":string[]}。\n\n"
             + context
         )
         result = await provider.generate(prompt=prompt, model=settings.auto_reasoning_model_id)
-        summary_text = result.final_text.strip()
+        raw = result.final_text.strip()
+        summary_text = raw
+        summary_json = ""
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                summary_json = json.dumps(parsed, ensure_ascii=False)
+                summary_text = str(parsed.get("summary") or "").strip() or summary_text
+        except json.JSONDecodeError:
+            summary_json = json.dumps(
+                {
+                    "summary": summary_text,
+                    "user_goals": [],
+                    "requirements": [],
+                    "decisions": [],
+                    "constraints": [],
+                    "important_details": [],
+                    "open_tasks": [],
+                },
+                ensure_ascii=False,
+            )
+
         session_manager.set_topic_summary(key, summary_text)
+        session_manager.set_scope_summary_json(key, summary_json)
         if summary_text:
             await bot.send_message(
                 chat_id=key.chat_id,
