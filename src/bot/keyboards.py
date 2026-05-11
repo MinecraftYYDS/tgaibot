@@ -6,11 +6,14 @@ from src.config import settings
 
 
 def model_selection_keyboard() -> InlineKeyboardMarkup:
+    from src.bot.runtime import failed_ping_models  # local import to avoid circular dep
+
     rows: list[list[InlineKeyboardButton]] = [[InlineKeyboardButton(text="自动路由", callback_data="model:auto")]]
     for model in settings.model_catalog:
         if "tts" in model.tags:
             continue
-        rows.append([InlineKeyboardButton(text=model.label, callback_data=f"model:{model.id}")])
+        label = f"🔴 {model.label}" if model.id in failed_ping_models else model.label
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"model:{model.id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
