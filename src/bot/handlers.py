@@ -7,9 +7,9 @@ from time import monotonic
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command
-from aiogram.types import BusinessMessagesDeleted, Message
+from aiogram.types import BusinessMessagesDeleted, InlineKeyboardMarkup, Message
 
-from src.bot.keyboards import control_keyboard, model_selection_keyboard
+from src.bot.keyboards import control_keyboard, model_selection_keyboard, stop_only_keyboard
 from src.bot.runtime import generation_control, model_router, provider, session_manager
 from src.config import settings
 from src.llm.reasoning import post_process_reasoning
@@ -21,7 +21,12 @@ logger = logging.getLogger(__name__)
 router = Router(name="handlers")
 
 
-async def _safe_edit_markdown(message: Message, text: str, retry_on_flood: bool = False) -> None:
+async def _safe_edit_markdown(
+    message: Message,
+    text: str,
+    retry_on_flood: bool = False,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
     """Edit a message with Markdown; falls back to plain text on parse error.
 
     During streaming (retry_on_flood=False) rate-limit errors are silently
@@ -29,9 +34,10 @@ async def _safe_edit_markdown(message: Message, text: str, retry_on_flood: bool 
     retry_on_flood=True to wait and retry up to a few times.
     """
     max_flood_attempts = 4 if retry_on_flood else 1
+    keyboard = reply_markup if reply_markup is not None else control_keyboard()
     for flood_attempt in range(max_flood_attempts):
         try:
-            await message.edit_text(text, reply_markup=control_keyboard(), parse_mode="Markdown")
+            await message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
             return
         except TelegramRetryAfter as exc:
             if retry_on_flood and flood_attempt < max_flood_attempts - 1:
@@ -45,7 +51,7 @@ async def _safe_edit_markdown(message: Message, text: str, retry_on_flood: bool 
             if "parse entities" not in error_text:
                 raise
             try:
-                await message.edit_text(text, reply_markup=control_keyboard())
+                await message.edit_text(text, reply_markup=keyboard)
                 return
             except TelegramBadRequest as fallback_exc:
                 if "message is not modified" in str(fallback_exc).lower():
@@ -68,6 +74,71 @@ def _format_elapsed(seconds: float) -> str:
     return f"{remaining_seconds} s"
 
 
+def _extract_command_argument(raw_text: str, command: str) -> str:
+    if not raw_text:
+        return ""
+    stripped = raw_text.strip()
+    if not stripped.startswith("/"):
+        return ""
+    first_token, _, remainder = stripped.partition(" ")
+    token_base = first_token.split("@", maxsplit=1)[0].lower()
+    if token_base != f"/{command}":
+        return ""
+    return remainder.strip()
+
+
+def _split_telegram_text(text: str, limit: int = 3500) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+    parts: list[str] = []
+    start = 0
+    while start < len(text):
+        end = min(start + limit, len(text))
+        split_at = text.rfind("\n", start, end)
+        if split_at <= start:
+            split_at = end
+        parts.append(text[start:split_at].strip())
+        start = split_at
+    return [p for p in parts if p]
+
+
+async def _cleanup_new_topic_seed_messages(topic_key: TopicKey) -> None:
+    from src.bot import runtime
+
+    pair = runtime.pending_new_topic_cleanup.pop(topic_key.value, None)
+    if not pair or runtime.bot is None:
+        return
+    new_cmd_msg_id, created_msg_id = pair
+    for message_id in (new_cmd_msg_id, created_msg_id):
+        try:
+            await runtime.bot.delete_message(chat_id=topic_key.chat_id, message_id=message_id)
+        except Exception:
+            logger.debug(
+                "skip delete seed message chat=%s thread=%s message_id=%s",
+                topic_key.chat_id,
+                topic_key.message_thread_id,
+                message_id,
+            )
+
+
+def _extract_main_forum_mention_prompt(message: Message) -> str:
+    from src.bot import runtime
+
+    text = (message.text or "").strip()
+    bot_username = runtime.bot_username.strip().lower()
+    if not text or not bot_username:
+        return ""
+
+    mention = f"@{bot_username}"
+    lowered = text.lower()
+    idx = lowered.find(mention)
+    if idx < 0:
+        return ""
+
+    prompt = (text[:idx] + text[idx + len(mention) :]).strip(" \t\n,:，：")
+    return prompt
+
+
 @router.message(Command("start"))
 async def on_start(message: Message) -> None:
     await message.answer(
@@ -84,7 +155,9 @@ async def on_start(message: Message) -> None:
 
 @router.message(Command("new"))
 async def on_new(message: Message) -> None:
-    from src.bot.runtime import bot
+    from src.bot import runtime
+
+    bot = runtime.bot
     # If in main forum, auto-create a new topic
     if message.message_thread_id is None or message.message_thread_id == 0:
         if bot is None:
@@ -100,13 +173,16 @@ async def on_new(message: Message) -> None:
             topic_key = TopicKey(chat_id=message.chat.id, message_thread_id=topic_id)
             session_manager.get_or_create_topic(topic_key)
             topic_link = f"https://t.me/c/{str(message.chat.id)[4:]}/{topic_id}"
+            created_message_id = 0
             for attempt in range(4):
                 try:
-                    await message.answer(
+                    created_notice = await message.answer(
                         f"✅ 已创建新话题：[点我进入新话题]({topic_link})",
                         parse_mode="Markdown",
                         disable_web_page_preview=True,
+                        reply_to_message_id=message.message_id,
                     )
+                    created_message_id = created_notice.message_id
                     break
                 except TelegramRetryAfter as exc:
                     if attempt < 3:
@@ -128,6 +204,8 @@ async def on_new(message: Message) -> None:
                         await asyncio.sleep(exc.retry_after)
                     else:
                         raise
+            if created_message_id:
+                runtime.pending_new_topic_cleanup[topic_key.value] = (message.message_id, created_message_id)
         except Exception as e:
             await message.answer(f"❌ 创建话题失败: {e}")
         return
@@ -159,7 +237,7 @@ async def on_models(message: Message) -> None:
 @router.message(Command("search"))
 async def on_search(message: Message) -> None:
     raw = (message.text or "").strip()
-    query = raw[len("/search") :].strip() if raw.startswith("/search") else ""
+    query = _extract_command_argument(raw, "search")
     if not query:
         await message.answer("🔎 用法：/search 关键词 或 /search 关键词 | 结果数(1-10)")
         return
@@ -170,6 +248,9 @@ async def on_search(message: Message) -> None:
         await message.answer(f"❌ 联网搜索失败：{result}")
         return
     await message.answer(f"✅ 联网搜索完成：{display_query}")
+    for idx, part in enumerate(_split_telegram_text(result), start=1):
+        prefix = f"📄 搜索结果（第 {idx} 段）\n\n" if len(result) > 3500 else "📄 搜索结果\n\n"
+        await message.answer(prefix + part)
 
 
 # ---------------------------------------------------------------------------
@@ -277,18 +358,42 @@ async def on_ping(message: Message) -> None:
 
 @router.message(F.text)
 async def on_text(message: Message) -> None:
-    if message.message_thread_id is None or message.message_thread_id == 0:
-        await message.answer("⚠️ 请在论坛话题内聊天")
-        return
+    is_default_topic = message.message_thread_id is None or message.message_thread_id == 0
     user_id = message.from_user.id if message.from_user else None
     is_allowed_user = user_id in settings.allowed_user_ids if user_id is not None else False
     if settings.allowed_chat_ids and message.chat.id not in settings.allowed_chat_ids and not is_allowed_user:
         await message.answer("❌ 此群组未被授权使用此机器人")
         return
 
+    if is_default_topic:
+        prompt = _extract_main_forum_mention_prompt(message)
+        if not prompt:
+            return
+
+        topic_key = TopicKey(chat_id=message.chat.id, message_thread_id=0)
+        session_manager.get_or_create_topic(topic_key)
+        session_manager.append_message(
+            key=topic_key,
+            telegram_message_id=message.message_id,
+            role="user",
+            content=prompt,
+        )
+
+        route = RouteResult(mode="manual", model=settings.auto_simple_model_id, reason="主话题 @bot 默认模型")
+        await _run_generation(
+            message=message,
+            topic_key=topic_key,
+            prompt_for_model=prompt,
+            route=route,
+            context_message_limit=15,
+            reply_markup=stop_only_keyboard(),
+        )
+        return
+
     incoming_text = message.text or ""
     topic_key = TopicKey(chat_id=message.chat.id, message_thread_id=message.message_thread_id)
     session_manager.get_or_create_topic(topic_key)
+    await _cleanup_new_topic_seed_messages(topic_key)
     session_manager.append_message(
         key=topic_key,
         telegram_message_id=message.message_id,
@@ -311,7 +416,6 @@ async def on_text(message: Message) -> None:
 @router.message(F.photo)
 async def on_photo(message: Message) -> None:
     if message.message_thread_id is None or message.message_thread_id == 0:
-        await message.answer("⚠️ 请在论坛话题内聊天")
         return
     user_id = message.from_user.id if message.from_user else None
     is_allowed_user = user_id in settings.allowed_user_ids if user_id is not None else False
@@ -325,6 +429,7 @@ async def on_photo(message: Message) -> None:
 
     topic_key = TopicKey(chat_id=message.chat.id, message_thread_id=message.message_thread_id)
     session_manager.get_or_create_topic(topic_key)
+    await _cleanup_new_topic_seed_messages(topic_key)
     # Store the caption (or placeholder) as the user message in history.
     session_manager.append_message(
         key=topic_key,
@@ -377,22 +482,25 @@ async def _run_generation(
     route: RouteResult,
     image_bytes: bytes | None = None,
     image_mime_type: str = "image/jpeg",
+    context_message_limit: int | None = None,
+    reply_markup: InlineKeyboardMarkup | None = None,
 ) -> None:
+    active_reply_markup = reply_markup if reply_markup is not None else control_keyboard()
     started_at = monotonic()
     header = f"🤖 模型: {route.model}\n📋 原因: {route.reason}\n\n"
     try:
         sent = await message.answer(
             header + f"⏳ 思考中... {_format_elapsed(monotonic() - started_at)}",
-            reply_markup=control_keyboard(),
+            reply_markup=active_reply_markup,
             parse_mode="Markdown",
         )
     except TelegramBadRequest:
         sent = await message.answer(
             header + f"⏳ 思考中... {_format_elapsed(monotonic() - started_at)}",
-            reply_markup=control_keyboard(),
+            reply_markup=active_reply_markup,
         )
 
-    context_text = session_manager.collect_context_for_response(topic_key)
+    context_text = session_manager.collect_context_for_response(topic_key, max_messages=context_message_limit)
     generation_control.begin(topic_key.value)
 
     tool_status = ""
@@ -421,20 +529,24 @@ async def _run_generation(
                     tool_status = "🛠️ 正在调用工具：联网搜索..."
             elif tool_name in {"", "undefined", "unknown_tool"}:
                 tool_status = "🛠️ 正在调用工具：未知工具"
+            elif tool_name == "fetch_webpage":
+                tool_status = "🛠️ 正在抓取网页内容..."
             else:
                 tool_status = f"🛠️ 正在调用工具：{tool_name}"
-            await _safe_edit_markdown(sent, _current_stream_render())
+            await _safe_edit_markdown(sent, _current_stream_render(), reply_markup=active_reply_markup)
         elif action == "done":
             if tool_name == "search":
                 if display_query:
                     tool_status = f"✅ 联网搜索完成（{display_query}），正在生成最终回答..."
                 else:
                     tool_status = "✅ 联网搜索完成，正在生成最终回答..."
+            elif tool_name == "fetch_webpage":
+                tool_status = "✅ 网页抓取完成，正在生成最终回答..."
             elif tool_name in {"", "undefined", "unknown_tool"}:
                 tool_status = "✅ 工具调用完成，正在生成最终回答..."
             else:
                 tool_status = f"✅ 工具 {tool_name} 调用完成，正在生成最终回答..."
-            await _safe_edit_markdown(sent, _current_stream_render())
+            await _safe_edit_markdown(sent, _current_stream_render(), reply_markup=active_reply_markup)
 
     last_edit = monotonic()
     built_answer = ""
@@ -451,7 +563,7 @@ async def _run_generation(
                 pass
             if thinking_timer_stop.is_set() or built_answer:
                 break
-            await _safe_edit_markdown(sent, _current_stream_render())
+            await _safe_edit_markdown(sent, _current_stream_render(), reply_markup=active_reply_markup)
 
     thinking_timer_task = asyncio.create_task(_thinking_timer_loop())
     try:
@@ -469,7 +581,7 @@ async def _run_generation(
             built_answer += chunk
             now = monotonic()
             if now - last_edit >= settings.stream_edit_interval_seconds:
-                await _safe_edit_markdown(sent, _current_stream_render())
+                await _safe_edit_markdown(sent, _current_stream_render(), reply_markup=active_reply_markup)
                 last_edit = now
     except Exception as exc:  # noqa: BLE001
         err_text = str(exc)
@@ -508,7 +620,7 @@ async def _run_generation(
                     built_answer += chunk
                     now = monotonic()
                     if now - last_edit >= settings.stream_edit_interval_seconds:
-                        await _safe_edit_markdown(sent, _current_stream_render())
+                        await _safe_edit_markdown(sent, _current_stream_render(), reply_markup=active_reply_markup)
                         last_edit = now
             except Exception as fallback_exc:  # noqa: BLE001
                 stop_reason = "error"
@@ -534,7 +646,7 @@ async def _run_generation(
     stats_text = f"⌛️ 用时：{total_elapsed}\n⚒️ 调用工具：{tool_call_count} 次\n\n"
     final_render = header + stats_text + final_text
 
-    await _safe_edit_markdown(sent, final_render, retry_on_flood=True)
+    await _safe_edit_markdown(sent, final_render, retry_on_flood=True, reply_markup=active_reply_markup)
     session_manager.append_message(
         key=topic_key,
         telegram_message_id=sent.message_id,

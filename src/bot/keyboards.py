@@ -35,3 +35,11 @@ def control_keyboard() -> InlineKeyboardMarkup:
             ],
         ]
     )
+
+
+def stop_only_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="停止生成", callback_data="control:stop")],
+        ]
+    )

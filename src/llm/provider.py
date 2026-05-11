@@ -54,10 +54,64 @@ class LLMProvider:
                 raise ValueError(f"模型 {profile.id} 属于 TTS 语音模型，不能用于文本聊天。请切换到对话模型。")
             api_key = self._pick_api_key(profile.api_key_env)
             if api_key:
+                try:
+                    async for chunk in self._stream_openai_compatible(
+                        prompt=prompt,
+                        profile_model_name=profile.model_name,
+                        profile_base_url=profile.base_url,
+                        api_key=api_key,
+                        context_messages=context_messages or [],
+                        image_bytes=image_bytes,
+                        image_mime_type=image_mime_type,
+                    ):
+                        yield chunk
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "stream mode failed for model=%s, fallback to tool-loop mode: %s",
+                        profile.model_name,
+                        type(exc).__name__,
+                    )
+                    final_text = await self._generate_with_tool_calls(
+                        prompt=prompt,
+                        profile_model_name=profile.model_name,
+                        profile_base_url=profile.base_url,
+                        api_key=api_key,
+                        context_messages=context_messages or [],
+                        on_tool_event=on_tool_event,
+                        image_bytes=image_bytes,
+                        image_mime_type=image_mime_type,
+                    )
+                    for chunk in self._chunk_text(final_text):
+                        yield chunk
+                    return
+
+        # Compatibility path when old model IDs are passed directly.
+        if settings.openai_key_pool:
+            fallback_model = settings.openai_model if model.startswith("openai_") else model
+            api_key = self._pick_from_pool(settings.openai_key_pool, "OPENAI_API_KEYS")
+            try:
+                async for chunk in self._stream_openai_compatible(
+                    prompt=prompt,
+                    profile_model_name=fallback_model,
+                    profile_base_url=settings.openai_base_url,
+                    api_key=api_key,
+                    context_messages=context_messages or [],
+                    image_bytes=image_bytes,
+                    image_mime_type=image_mime_type,
+                ):
+                    yield chunk
+                return
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "stream mode failed for fallback model=%s, fallback to tool-loop mode: %s",
+                    fallback_model,
+                    type(exc).__name__,
+                )
                 final_text = await self._generate_with_tool_calls(
                     prompt=prompt,
-                    profile_model_name=profile.model_name,
-                    profile_base_url=profile.base_url,
+                    profile_model_name=fallback_model,
+                    profile_base_url=settings.openai_base_url,
                     api_key=api_key,
                     context_messages=context_messages or [],
                     on_tool_event=on_tool_event,
@@ -67,22 +121,6 @@ class LLMProvider:
                 for chunk in self._chunk_text(final_text):
                     yield chunk
                 return
-
-        # Compatibility path when old model IDs are passed directly.
-        if settings.openai_key_pool:
-            final_text = await self._generate_with_tool_calls(
-                prompt=prompt,
-                profile_model_name=settings.openai_model if model.startswith("openai_") else model,
-                profile_base_url=settings.openai_base_url,
-                api_key=self._pick_from_pool(settings.openai_key_pool, "OPENAI_API_KEYS"),
-                context_messages=context_messages or [],
-                on_tool_event=on_tool_event,
-                image_bytes=image_bytes,
-                image_mime_type=image_mime_type,
-            )
-            for chunk in self._chunk_text(final_text):
-                yield chunk
-            return
 
         for chunk in self._chunk_text(f"[model={model}] {prompt}"):
             yield chunk
@@ -108,30 +146,12 @@ class LLMProvider:
         image_bytes: bytes | None = None,
         image_mime_type: str = "image/jpeg",
     ) -> str:
-        messages: list[dict] = [
-            {"role": "system", "content": "你是一个有帮助的AI助手。请用中文回答用户的问题。尽可能简洁、准确、有用。"},
-        ]
-        if context_messages:
-            for msg in context_messages:
-                role = str(msg.get("role") or "").strip()
-                content = str(msg.get("content") or "").strip()
-                if role in {"user", "assistant"} and content:
-                    packed: dict[str, object] = {"role": role, "content": content}
-                    if role == "assistant":
-                        reasoning_content = str(msg.get("reasoning_content") or "").strip()
-                        if reasoning_content:
-                            packed["reasoning_content"] = reasoning_content
-                    messages.append(packed)
-
-        if image_bytes:
-            b64 = base64.b64encode(image_bytes).decode("ascii")
-            user_content: object = [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:{image_mime_type};base64,{b64}"}},
-            ]
-        else:
-            user_content = prompt
-        messages.append({"role": "user", "content": user_content})
+        messages = self._build_messages(
+            prompt=prompt,
+            context_messages=context_messages,
+            image_bytes=image_bytes,
+            image_mime_type=image_mime_type,
+        )
 
         tools = [
             {
@@ -155,6 +175,21 @@ class LLMProvider:
                     "name": "time_now",
                     "description": "获取当前 UTC 时间。",
                     "parameters": {"type": "object", "properties": {}, "required": []},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "fetch_webpage",
+                    "description": "抓取网页内容并返回可读文本摘要，适合需要精读指定 URL 的场景。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "url": {"type": "string", "description": "完整网页 URL"},
+                            "max_chars": {"type": "integer", "description": "返回文本最大长度", "default": 5000},
+                        },
+                        "required": ["url"],
+                    },
                 },
             },
             {
@@ -233,6 +268,11 @@ class LLMProvider:
                     tool_name = "echo"
                 elif name == "time_now":
                     tool_name = "time_now"
+                elif name in {"fetch_webpage", "web_fetch", "get_webpage"}:
+                    url = str(parsed_args.get("url") or "").strip()
+                    max_chars = int(parsed_args.get("max_chars") or 5000)
+                    argument = f"{url} | {max_chars}"
+                    tool_name = "fetch_webpage"
                 else:
                     tool_name = name if name else "unknown_tool"
 
@@ -367,6 +407,102 @@ class LLMProvider:
                 return response.json()
 
         return {}
+
+    def _build_messages(
+        self,
+        prompt: str,
+        context_messages: list[dict] | None = None,
+        image_bytes: bytes | None = None,
+        image_mime_type: str = "image/jpeg",
+    ) -> list[dict]:
+        messages: list[dict] = [
+            {"role": "system", "content": "你是一个有帮助的AI助手。请用中文回答用户的问题。尽可能简洁、准确、有用。"},
+        ]
+        if context_messages:
+            for msg in context_messages:
+                role = str(msg.get("role") or "").strip()
+                content = str(msg.get("content") or "").strip()
+                if role in {"user", "assistant"} and content:
+                    packed: dict[str, object] = {"role": role, "content": content}
+                    if role == "assistant":
+                        reasoning_content = str(msg.get("reasoning_content") or "").strip()
+                        if reasoning_content:
+                            packed["reasoning_content"] = reasoning_content
+                    messages.append(packed)
+
+        if image_bytes:
+            b64 = base64.b64encode(image_bytes).decode("ascii")
+            user_content: object = [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:{image_mime_type};base64,{b64}"}},
+            ]
+        else:
+            user_content = prompt
+        messages.append({"role": "user", "content": user_content})
+        return messages
+
+    async def _stream_openai_compatible(
+        self,
+        prompt: str,
+        profile_model_name: str,
+        profile_base_url: str,
+        api_key: str,
+        context_messages: list[dict] | None = None,
+        image_bytes: bytes | None = None,
+        image_mime_type: str = "image/jpeg",
+    ) -> AsyncIterator[str]:
+        base_url = profile_base_url.rstrip("/") if profile_base_url else "https://api.openai.com/v1"
+        endpoint = f"{base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": profile_model_name,
+            "messages": self._build_messages(
+                prompt=prompt,
+                context_messages=context_messages,
+                image_bytes=image_bytes,
+                image_mime_type=image_mime_type,
+            ),
+            "stream": True,
+        }
+
+        collected_reasoning: list[str] = []
+        got_text = False
+        async with httpx.AsyncClient(timeout=settings.provider_timeout_seconds) as client:
+            async with client.stream("POST", endpoint, headers=headers, json=payload) as response:
+                if response.status_code >= 400:
+                    error_text = (await response.aread()).decode("utf-8", errors="ignore").strip()
+                    raise ValueError(
+                        f"上游接口请求失败 HTTP {response.status_code}，模型={profile_model_name}，详情：{error_text or '无错误详情'}"
+                    )
+                async for raw_line in response.aiter_lines():
+                    line = (raw_line or "").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if not data or data == "[DONE]":
+                        continue
+                    try:
+                        obj = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = obj.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta") or {}
+                    content = delta.get("content")
+                    if isinstance(content, str) and content:
+                        got_text = True
+                        yield content
+                    reasoning_content = delta.get("reasoning_content")
+                    if isinstance(reasoning_content, str) and reasoning_content:
+                        collected_reasoning.append(reasoning_content)
+
+        self._last_reasoning_content = "".join(collected_reasoning).strip()
+        if not got_text:
+            raise ValueError("流式响应为空")
 
     def _pick_api_key(self, env_name: str) -> str:
         raw = os.getenv(env_name, "").strip()

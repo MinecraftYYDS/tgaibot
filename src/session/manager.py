@@ -140,8 +140,11 @@ class TopicSessionManager:
             topic.summary = summary
             db.add(topic)
 
-    def collect_context_for_response(self, key: TopicKey) -> list[dict]:
-        """Collect ALL conversation history for LLM context (complete topic session)."""
+    def collect_context_for_response(self, key: TopicKey, max_messages: int | None = None) -> list[dict]:
+        """Collect conversation history for LLM context.
+
+        If max_messages is set, only the last N messages are returned.
+        """
         with topic_transaction(key.value) as db:
             topic = self._fetch_topic_for_update(db, key)
             stmt = (
@@ -150,6 +153,8 @@ class TopicSessionManager:
                 .order_by(asc(Message.id))
             )
             items = db.execute(stmt).scalars().all()
+            if max_messages is not None and max_messages > 0:
+                items = items[-max_messages:]
             messages: list[dict] = []
             for item in items:
                 msg = {

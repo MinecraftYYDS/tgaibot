@@ -15,6 +15,11 @@ model_router = ModelRouter()
 provider = LLMProvider()
 generation_control = GenerationControl()
 bot: Bot | None = None
+bot_username: str = ""
 
 # Models that failed the last /ping test; cleared/updated on each /ping run.
 failed_ping_models: set[str] = set()
+
+# Pending cleanup after /new: key is "chat_id:thread_id", value is
+# (new_command_message_id, creation_notice_message_id).
+pending_new_topic_cleanup: dict[str, tuple[int, int]] = {}

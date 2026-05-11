@@ -28,6 +28,8 @@ async def run_bot() -> None:
     bot = Bot(token=settings.telegram_bot_token)
     from src.bot import runtime
     runtime.bot = bot
+    me = await bot.get_me()
+    runtime.bot_username = (me.username or "").lower()
     dp = Dispatcher()
     dp.include_router(callbacks_router)
     dp.include_router(handlers_router)
