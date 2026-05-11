@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
 
 from aiogram import Router
-from aiogram.types import BufferedInputFile, CallbackQuery
+from aiogram.types import CallbackQuery
 
 from src.bot.keyboards import control_keyboard
 from src.bot.runtime import generation_control, session_manager
@@ -12,27 +11,6 @@ from src.session.manager import TopicKey
 
 logger = logging.getLogger(__name__)
 router = Router(name="callbacks")
-
-PREVIEW_CHARS_ON_OVERFLOW = 1800
-
-
-def _split_preview_and_tail(text: str, head_chars: int = PREVIEW_CHARS_ON_OVERFLOW) -> tuple[str, str]:
-    if len(text) <= head_chars:
-        return text, ""
-    return text[:head_chars], text[head_chars:]
-
-
-async def _send_refresh_text(callback: CallbackQuery, key: TopicKey, text: str) -> None:
-    if callback.message is None:
-        return
-    preview, overflow = _split_preview_and_tail(text)
-    if overflow:
-        await callback.message.answer(preview + "\n\n...(内容过长，剩余内容见txt附件)", reply_markup=control_keyboard())
-        file_name = f"ai_refresh_full_{key.message_thread_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.txt"
-        payload = BufferedInputFile(text.encode("utf-8"), filename=file_name)
-        await callback.message.answer_document(payload, caption="📎 完整内容（txt）")
-        return
-    await callback.message.answer(preview, reply_markup=control_keyboard())
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("model:"))
@@ -55,38 +33,6 @@ async def on_stop(callback: CallbackQuery) -> None:
         key = TopicKey(chat_id=callback.message.chat.id, message_thread_id=callback.message.message_thread_id)
         generation_control.stop(key.value)
     await callback.answer("⏹️ 已请求停止生成")
-
-
-@router.callback_query(lambda c: c.data and c.data == "control:refresh")
-async def on_refresh(callback: CallbackQuery) -> None:
-    if callback.message and callback.message.message_thread_id is not None:
-        from src.bot import runtime
-
-        key = TopicKey(chat_id=callback.message.chat.id, message_thread_id=callback.message.message_thread_id)
-        generation_control.stop(key.value)
-        runtime.user_takeover_topics.add(key.value)
-
-        snapshot = runtime.active_stream_snapshots.get(key.value)
-        latest_text = snapshot.latest_render_text if snapshot is not None else ""
-        if not latest_text:
-            latest_assistant = session_manager.get_latest_assistant_content(key)
-            latest_text = latest_assistant if latest_assistant else ""
-
-        if not latest_text:
-            await callback.answer("⚠️ 暂无可刷新的内容", show_alert=False)
-            return
-
-        try:
-            await callback.message.delete()
-        except Exception:  # noqa: BLE001
-            logger.debug("refresh delete old message skipped", exc_info=True)
-
-        runtime.active_stream_snapshots.pop(key.value, None)
-
-        await _send_refresh_text(callback, key, latest_text)
-        await callback.answer("🔄 已刷新并重发最新结果")
-        return
-    await callback.answer("❌ 无话题上下文")
 
 
 @router.callback_query(lambda c: c.data and c.data == "control:summarize")

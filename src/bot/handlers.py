@@ -137,6 +137,15 @@ async def _send_tail_as_txt(message: Message, topic_key: TopicKey, tail_text: st
     await message.answer_document(payload, caption="📎 完整内容（txt）")
 
 
+async def _send_refreshed_content(message: Message, topic_key: TopicKey, full_text: str) -> None:
+    preview, overflow = _split_preview_and_tail(full_text)
+    if overflow:
+        await message.answer(preview + "\n\n...(内容过长，剩余内容见txt附件)", reply_markup=control_keyboard())
+        await _send_tail_as_txt(message, topic_key, full_text)
+        return
+    await message.answer(preview, reply_markup=control_keyboard())
+
+
 async def _cleanup_new_topic_seed_messages(topic_key: TopicKey) -> None:
     from src.bot import runtime
 
@@ -259,6 +268,44 @@ async def on_stop(message: Message) -> None:
     topic_key = TopicKey(chat_id=message.chat.id, message_thread_id=message.message_thread_id)
     generation_control.stop(topic_key.value)
     await message.answer("⏹️ 已请求停止本话题的生成")
+
+
+@router.message(Command("re"))
+async def on_refresh_by_command(message: Message) -> None:
+    from src.bot import runtime
+
+    if message.message_thread_id is None or message.message_thread_id == 0:
+        await message.answer("⚠️ 请在论坛话题内使用 /re")
+        return
+    if message.reply_to_message is None:
+        await message.answer("⚠️ 请引用一条 AI 消息后再发送 /re")
+        return
+
+    topic_key = TopicKey(chat_id=message.chat.id, message_thread_id=message.message_thread_id)
+    replied_message_id = message.reply_to_message.message_id
+
+    generation_control.stop(topic_key.value)
+    runtime.user_takeover_topics.add(topic_key.value)
+
+    latest_text = ""
+    snapshot = runtime.active_stream_snapshots.get(topic_key.value)
+    if snapshot is not None and snapshot.assistant_message_id == replied_message_id:
+        latest_text = snapshot.latest_render_text or ""
+    if not latest_text:
+        latest_text = session_manager.get_assistant_content_by_telegram_message_id(topic_key, replied_message_id)
+
+    if not latest_text:
+        await message.answer("⚠️ 你引用的不是可刷新的 AI 消息")
+        return
+
+    if snapshot is not None and snapshot.assistant_message_id == replied_message_id and runtime.bot is not None:
+        try:
+            await runtime.bot.delete_message(chat_id=topic_key.chat_id, message_id=replied_message_id)
+        except Exception:
+            logger.debug("/re delete target message skipped", exc_info=True)
+        runtime.active_stream_snapshots.pop(topic_key.value, None)
+
+    await _send_refreshed_content(message, topic_key, latest_text)
 
 
 @router.message(Command("models"))

@@ -198,6 +198,20 @@ class TopicSessionManager:
                 return ""
             return str(items[-1].content or "")
 
+    def get_assistant_content_by_telegram_message_id(self, key: TopicKey, telegram_message_id: int) -> str:
+        with topic_transaction(key.value) as db:
+            topic = self._fetch_topic_for_update(db, key)
+            stmt = select(Message).where(
+                Message.topic_id == topic.id,
+                Message.deleted.is_(False),
+                Message.role == "assistant",
+                Message.telegram_message_id == telegram_message_id,
+            )
+            message = db.execute(stmt).scalar_one_or_none()
+            if message is None:
+                return ""
+            return str(message.content or "")
+
     def enqueue_job(self, key: TopicKey, job_type: str, payload: dict[str, object]) -> int:
         with topic_transaction(key.value) as db:
             topic = self._fetch_topic_for_update(db, key)
