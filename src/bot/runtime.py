@@ -32,6 +32,7 @@ class ActiveStreamSnapshot:
     message_thread_id: int
     assistant_message_id: int
     latest_render_text: str
+    latest_answer_text: str
     is_topic_controls: bool
 
 

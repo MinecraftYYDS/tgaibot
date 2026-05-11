@@ -290,7 +290,7 @@ async def on_refresh_by_command(message: Message) -> None:
     latest_text = ""
     snapshot = runtime.active_stream_snapshots.get(topic_key.value)
     if snapshot is not None and snapshot.assistant_message_id == replied_message_id:
-        latest_text = snapshot.latest_render_text or ""
+        latest_text = snapshot.latest_answer_text or snapshot.latest_render_text or ""
     if not latest_text:
         latest_text = session_manager.get_assistant_content_by_telegram_message_id(topic_key, replied_message_id)
 
@@ -598,6 +598,7 @@ async def _run_generation(
         message_thread_id=topic_key.message_thread_id,
         assistant_message_id=sent.message_id,
         latest_render_text=header + f"⏳ 思考中... {_format_elapsed(monotonic() - started_at)}",
+        latest_answer_text="",
         is_topic_controls=is_topic_controls,
     )
 
@@ -698,6 +699,9 @@ async def _run_generation(
                 stop_reason = "user_takeover"
                 break
             built_answer += chunk
+            snapshot = runtime.active_stream_snapshots.get(topic_key.value)
+            if snapshot is not None:
+                snapshot.latest_answer_text = built_answer
             now = monotonic()
             if now - last_edit >= settings.stream_edit_interval_seconds:
                 current = _current_stream_render()
@@ -747,6 +751,9 @@ async def _run_generation(
                         stop_reason = "user_takeover"
                         break
                     built_answer += chunk
+                    snapshot = runtime.active_stream_snapshots.get(topic_key.value)
+                    if snapshot is not None:
+                        snapshot.latest_answer_text = built_answer
                     now = monotonic()
                     if now - last_edit >= settings.stream_edit_interval_seconds:
                         current = _current_stream_render()
@@ -781,6 +788,10 @@ async def _run_generation(
     total_elapsed = _format_elapsed(monotonic() - started_at)
     stats_text = f"⌛️ 用时：{total_elapsed}\n⚒️ 调用工具：{tool_call_count} 次\n\n"
     final_render = header + stats_text + final_text
+    snapshot = runtime.active_stream_snapshots.get(topic_key.value)
+    if snapshot is not None:
+        snapshot.latest_answer_text = final_text
+        snapshot.latest_render_text = final_render
     if _taken_over_by_user():
         runtime.active_stream_snapshots.pop(topic_key.value, None)
         return
