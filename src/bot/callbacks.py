@@ -7,14 +7,25 @@ from aiogram.types import CallbackQuery
 
 from src.bot.keyboards import control_keyboard
 from src.bot.runtime import generation_control, session_manager
+from src.config import settings
 from src.session.manager import TopicKey
 
 logger = logging.getLogger(__name__)
 router = Router(name="callbacks")
 
 
+async def _ensure_ai_permission(callback: CallbackQuery) -> bool:
+    user_id = callback.from_user.id if callback.from_user else None
+    if user_id is None or user_id not in settings.allowed_user_ids:
+        await callback.answer("❌ 无权限使用 AI", show_alert=True)
+        return False
+    return True
+
+
 @router.callback_query(lambda c: c.data and c.data.startswith("model:"))
 async def on_model_switch(callback: CallbackQuery) -> None:
+    if not await _ensure_ai_permission(callback):
+        return
     selected = callback.data.split(":", maxsplit=1)[1]
     if callback.message and callback.message.message_thread_id is not None:
         key = TopicKey(chat_id=callback.message.chat.id, message_thread_id=callback.message.message_thread_id)
@@ -29,6 +40,8 @@ async def on_model_switch(callback: CallbackQuery) -> None:
 
 @router.callback_query(lambda c: c.data and c.data == "control:stop")
 async def on_stop(callback: CallbackQuery) -> None:
+    if not await _ensure_ai_permission(callback):
+        return
     if callback.message and callback.message.message_thread_id is not None:
         key = TopicKey(chat_id=callback.message.chat.id, message_thread_id=callback.message.message_thread_id)
         generation_control.stop(key.value)
@@ -37,6 +50,8 @@ async def on_stop(callback: CallbackQuery) -> None:
 
 @router.callback_query(lambda c: c.data and c.data == "control:summarize")
 async def on_summarize(callback: CallbackQuery) -> None:
+    if not await _ensure_ai_permission(callback):
+        return
     if callback.message and callback.message.message_thread_id is not None:
         key = TopicKey(chat_id=callback.message.chat.id, message_thread_id=callback.message.message_thread_id)
         session_manager.enqueue_job(key=key, job_type="summarize", payload={"source": "button"})
@@ -48,6 +63,8 @@ async def on_summarize(callback: CallbackQuery) -> None:
 
 @router.callback_query(lambda c: c.data and c.data == "control:rename_topic")
 async def on_rename_topic(callback: CallbackQuery) -> None:
+    if not await _ensure_ai_permission(callback):
+        return
     if callback.message and callback.message.message_thread_id is not None:
         key = TopicKey(chat_id=callback.message.chat.id, message_thread_id=callback.message.message_thread_id)
         try:

@@ -105,6 +105,25 @@ def _extract_command_argument(raw_text: str, command: str) -> str:
     return remainder.strip()
 
 
+def _private_topic_key_from_message(message: Message) -> TopicKey | None:
+    user_id = message.from_user.id if message.from_user else None
+    if user_id is None:
+        return None
+    return TopicKey(chat_id=user_id, message_thread_id=0)
+
+
+async def _ensure_ai_permission(message: Message) -> bool:
+    user_id = message.from_user.id if message.from_user else None
+    if user_id is None or user_id not in settings.allowed_user_ids:
+        await message.answer("❌ 无权限使用 AI（仅限 TELEGRAM_ALLOWED_USER_IDS 中的用户）")
+        return False
+    return True
+
+
+def _is_private_chat(message: Message) -> bool:
+    return message.chat.type == "private"
+
+
 def _split_telegram_text(text: str, limit: int = 3500) -> list[str]:
     if len(text) <= limit:
         return [text]
@@ -224,6 +243,28 @@ async def on_start(message: Message) -> None:
 async def on_new(message: Message) -> None:
     from src.bot import runtime
 
+    if not await _ensure_ai_permission(message):
+        return
+
+    if _is_private_chat(message):
+        private_key = _private_topic_key_from_message(message)
+        if private_key is None:
+            await message.answer("❌ 无法识别用户身份，无法清空私聊记忆")
+            return
+        generation_control.stop(private_key.value)
+        session_manager.get_or_create_topic(private_key)
+        changed = session_manager.clear_topic_memory(private_key)
+        runtime.active_stream_snapshots.pop(private_key.value, None)
+        runtime.user_takeover_topics.discard(private_key.value)
+        await message.answer(
+            "🧹 私聊记忆已清空\n"
+            f"- 清理消息: {changed.get('messages', 0)} 条\n"
+            f"- 清理总结: {changed.get('summary', 0)} 条\n"
+            f"- 清理检查点: {changed.get('checkpoints', 0)} 条\n"
+            f"- 清理任务: {changed.get('jobs', 0)} 条"
+        )
+        return
+
     bot = runtime.bot
     # If in main forum, auto-create a new topic
     if message.message_thread_id is None or message.message_thread_id == 0:
@@ -335,14 +376,58 @@ async def on_refresh_by_command(message: Message) -> None:
 
 @router.message(Command("models"))
 async def on_models(message: Message) -> None:
+    if not await _ensure_ai_permission(message):
+        return
     lines = ["📚 可用模型列表：\n"]
     for model in settings.model_catalog:
         lines.append(f"• {model.id}: {model.label}")
     await message.answer("\n".join(lines))
 
 
+@router.message(Command("model"))
+async def on_model(message: Message) -> None:
+    if not await _ensure_ai_permission(message):
+        return
+    if not _is_private_chat(message):
+        await message.answer("⚠️ /model 仅支持私聊。群话题请使用按钮切换模型。")
+        return
+
+    private_key = _private_topic_key_from_message(message)
+    if private_key is None:
+        await message.answer("❌ 无法识别用户身份")
+        return
+    session_manager.get_or_create_topic(private_key)
+
+    raw = (message.text or "").strip()
+    selected = _extract_command_argument(raw, "model")
+    if not selected:
+        mode, selected_model = session_manager.get_topic_model_selection(private_key)
+        current = selected_model if mode == "manual" and selected_model else "auto"
+        await message.answer(
+            "🧭 用法：/model auto 或 /model 模型ID\n"
+            f"当前私聊模型：{current}"
+        )
+        return
+
+    candidate = selected.strip()
+    if candidate == "auto":
+        session_manager.set_topic_model_selection(private_key, mode="auto", model_name="", reason="user_private_command")
+        await message.answer("✅ 私聊模型已切换为自动路由")
+        return
+
+    model_ids = {m.id for m in settings.model_catalog if "tts" not in m.tags}
+    if candidate not in model_ids:
+        await message.answer("❌ 模型不存在，请先使用 /models 查看可用模型")
+        return
+
+    session_manager.set_topic_model_selection(private_key, mode="manual", model_name=candidate, reason="user_private_command")
+    await message.answer(f"✅ 私聊模型已切换为: {candidate}")
+
+
 @router.message(Command("search"))
 async def on_search(message: Message) -> None:
+    if not await _ensure_ai_permission(message):
+        return
     raw = (message.text or "").strip()
     query = _extract_command_argument(raw, "search")
     if not query:
@@ -430,9 +515,7 @@ async def on_ping(message: Message) -> None:
         await message.answer("⚠️ /ping 只能在私聊或群组默认话题中使用")
         return
 
-    user_id = message.from_user.id if message.from_user else None
-    if user_id is None or user_id not in settings.allowed_user_ids:
-        await message.answer("❌ 无权限使用此命令（仅限 TELEGRAM_ALLOWED_USER_IDS 中的用户）")
+    if not await _ensure_ai_permission(message):
         return
 
     models = [m for m in settings.model_catalog if "tts" not in m.tags]
@@ -465,11 +548,40 @@ async def on_ping(message: Message) -> None:
 
 @router.message(F.text)
 async def on_text(message: Message) -> None:
+    if not await _ensure_ai_permission(message):
+        return
+
+    is_private = _is_private_chat(message)
     is_default_topic = message.message_thread_id is None or message.message_thread_id == 0
-    user_id = message.from_user.id if message.from_user else None
-    is_allowed_user = user_id in settings.allowed_user_ids if user_id is not None else False
-    if settings.allowed_chat_ids and message.chat.id not in settings.allowed_chat_ids and not is_allowed_user:
+    if not is_private and settings.allowed_chat_ids and message.chat.id not in settings.allowed_chat_ids:
         await message.answer("❌ 此群组未被授权使用此机器人")
+        return
+
+    if is_private:
+        incoming_text = (message.text or "").strip()
+        if not incoming_text:
+            return
+        topic_key = _private_topic_key_from_message(message)
+        if topic_key is None:
+            await message.answer("❌ 无法识别用户身份")
+            return
+        session_manager.get_or_create_topic(topic_key)
+        session_manager.append_message(
+            key=topic_key,
+            telegram_message_id=message.message_id,
+            role="user",
+            content=incoming_text,
+        )
+        mode, selected_model = session_manager.get_topic_model_selection(topic_key)
+        requested_mode = selected_model if mode == "manual" and selected_model else settings.default_model_mode
+        route = model_router.route(incoming_text, mode=requested_mode)
+        await _run_generation(
+            message=message,
+            topic_key=topic_key,
+            prompt_for_model=incoming_text,
+            route=route,
+            reply_markup=stop_only_keyboard(),
+        )
         return
 
     if is_default_topic:
@@ -522,11 +634,11 @@ async def on_text(message: Message) -> None:
 
 @router.message(F.photo)
 async def on_photo(message: Message) -> None:
+    if not await _ensure_ai_permission(message):
+        return
     if message.message_thread_id is None or message.message_thread_id == 0:
         return
-    user_id = message.from_user.id if message.from_user else None
-    is_allowed_user = user_id in settings.allowed_user_ids if user_id is not None else False
-    if settings.allowed_chat_ids and message.chat.id not in settings.allowed_chat_ids and not is_allowed_user:
+    if settings.allowed_chat_ids and message.chat.id not in settings.allowed_chat_ids:
         await message.answer("❌ 此群组未被授权使用此机器人")
         return
 

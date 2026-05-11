@@ -5,7 +5,7 @@ import json
 
 from sqlalchemy import asc, func, select
 
-from src.persistence.models import Job, Message, ModelState, StreamingCheckpoint, Topic
+from src.persistence.models import Job, Message, ModelState, StreamingCheckpoint, ToolState, Topic
 from src.sync.consistency import topic_transaction
 
 
@@ -121,6 +121,47 @@ class TopicSessionManager:
                 row.deleted = True
                 db.add(row)
             return len(rows)
+
+    def clear_topic_memory(self, key: TopicKey) -> dict[str, int]:
+        """Clear persisted memory for one topic/private scope.
+
+        This is used by private /new to reset all in-scope memory artifacts.
+        """
+        with topic_transaction(key.value) as db:
+            topic = self._fetch_topic_for_update(db, key)
+
+            msg_stmt = select(Message).where(Message.topic_id == topic.id, Message.deleted.is_(False))
+            messages = db.execute(msg_stmt).scalars().all()
+            for row in messages:
+                row.deleted = True
+                db.add(row)
+
+            checkpoint_stmt = select(StreamingCheckpoint).where(StreamingCheckpoint.topic_id == topic.id)
+            checkpoints = db.execute(checkpoint_stmt).scalars().all()
+            for row in checkpoints:
+                db.delete(row)
+
+            job_stmt = select(Job).where(Job.topic_id == topic.id)
+            jobs = db.execute(job_stmt).scalars().all()
+            for row in jobs:
+                db.delete(row)
+
+            tool_stmt = select(ToolState).where(ToolState.topic_id == topic.id)
+            tools = db.execute(tool_stmt).scalars().all()
+            for row in tools:
+                db.delete(row)
+
+            summary_cleared = 1 if topic.summary else 0
+            topic.summary = ""
+            db.add(topic)
+
+            return {
+                "messages": len(messages),
+                "checkpoints": len(checkpoints),
+                "jobs": len(jobs),
+                "tools": len(tools),
+                "summary": summary_cleared,
+            }
 
     def topic_message_count(self, key: TopicKey) -> int:
         with topic_transaction(key.value) as db:
