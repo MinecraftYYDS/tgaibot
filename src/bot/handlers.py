@@ -1146,7 +1146,7 @@ async def _run_generation(
     reasoning_text = "route_decision -> stream_generate"
     reasoning_raw = provider._last_reasoning_content or reasoning_text
     reasoning = post_process_reasoning(settings.reasoning_mode, reasoning_raw)
-    final_text = built_answer or "(无响应)"
+    final_text = built_answer or "(无响应：上游模型返回空正文，请切换模型或查看日志)"
     if stop_reason == "user_stop":
         final_text += "\n\n⏹️ 已停止"
     elif stop_reason == "error":

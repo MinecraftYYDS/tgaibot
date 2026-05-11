@@ -284,6 +284,13 @@ class LLMProvider:
             if tool_calls:
                 logger.debug(f"[tool-calls-raw] {tool_calls}")
             logger.debug(f"[model-content] {repr(assistant_content[:200])}")
+            if not assistant_content and assistant_reasoning:
+                logger.warning(
+                    "empty assistant content from model=%s reasoning_len=%s reasoning_preview=%r",
+                    profile_model_name,
+                    len(assistant_reasoning),
+                    assistant_reasoning[:200],
+                )
 
             assistant_msg: dict[str, object] = {
                 "role": "assistant",
@@ -381,8 +388,16 @@ class LLMProvider:
             return ""
         final_message = final_choices[0].get("message") or {}
         reasoning = str(final_message.get("reasoning_content") or "").strip()
+        final_content = str(final_message.get("content") or "")
+        if not final_content and reasoning:
+            logger.warning(
+                "empty final assistant content from model=%s reasoning_len=%s reasoning_preview=%r",
+                profile_model_name,
+                len(reasoning),
+                reasoning[:200],
+            )
         self._last_reasoning_content = reasoning
-        return str(final_message.get("content") or "")
+        return final_content
 
     async def _chat_openai_compatible(
         self,
