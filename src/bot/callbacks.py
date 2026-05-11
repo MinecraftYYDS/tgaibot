@@ -15,11 +15,23 @@ router = Router(name="callbacks")
 
 
 async def _ensure_ai_permission(callback: CallbackQuery) -> bool:
+    message = callback.message
     user_id = callback.from_user.id if callback.from_user else None
-    if user_id is None or user_id not in settings.allowed_user_ids:
-        await callback.answer("❌ 无权限使用 AI", show_alert=True)
-        return False
-    return True
+
+    if message is not None and message.chat.type == "private":
+        if user_id is None or user_id not in settings.allowed_user_ids:
+            await callback.answer("❌ 私聊无权限", show_alert=True)
+            return False
+        return True
+
+    if message is not None and settings.allowed_chat_ids and message.chat.id in settings.allowed_chat_ids:
+        return True
+
+    if user_id is not None and user_id in settings.allowed_user_ids:
+        return True
+
+    await callback.answer("❌ 无权限使用 AI", show_alert=True)
+    return False
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("model:"))

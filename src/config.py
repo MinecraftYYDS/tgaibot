@@ -23,6 +23,12 @@ class Settings(BaseSettings):
     auto_tool_model_id: str = Field(default="openai_tool", alias="AUTO_TOOL_MODEL_ID")
     reasoning_mode: str = Field(default="disabled", alias="REASONING_MODE")
     stream_edit_interval_seconds: float = Field(default=0.8, alias="STREAM_EDIT_INTERVAL_SECONDS")
+    max_context_tokens: int = Field(default=32000, alias="MAX_CONTEXT_TOKENS")
+    compression_trigger_tokens: int = Field(default=24000, alias="COMPRESSION_TRIGGER_TOKENS")
+    recent_window_size: int = Field(default=10, alias="RECENT_WINDOW_SIZE")
+    retrieval_top_k: int = Field(default=6, alias="RETRIEVAL_TOP_K")
+    embedding_chunk_size: int = Field(default=800, alias="EMBEDDING_CHUNK_SIZE")
+    embedding_enable: bool = Field(default=True, alias="EMBEDDING_ENABLE")
 
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     openai_api_keys: str = Field(default="", alias="OPENAI_API_KEYS")

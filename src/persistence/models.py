@@ -87,3 +87,47 @@ class StreamingCheckpoint(Base):
     partial_reasoning: Mapped[str] = mapped_column(Text, default="")
     stop_reason: Mapped[str] = mapped_column(String(50), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ConversationSummary(Base):
+    __tablename__ = "conversation_summaries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scope_type: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    scope_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    summary_json: Mapped[str] = mapped_column(Text, default="{}")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class LongTermMemory(Base):
+    __tablename__ = "long_term_memories"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    memory: Mapped[str] = mapped_column(Text, default="")
+    importance: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class PinnedMemory(Base):
+    __tablename__ = "pinned_memories"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scope_type: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    scope_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    content: Mapped[str] = mapped_column(Text, default="")
+    created_by: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class MessageEmbedding(Base):
+    __tablename__ = "message_embeddings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scope_type: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    scope_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    message_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    content: Mapped[str] = mapped_column(Text, default="")
+    embedding_json: Mapped[str] = mapped_column(Text, default="[]")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

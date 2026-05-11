@@ -5,7 +5,18 @@ import json
 
 from sqlalchemy import asc, func, select
 
-from src.persistence.models import Job, Message, ModelState, StreamingCheckpoint, ToolState, Topic
+from src.persistence.models import (
+    ConversationSummary,
+    Job,
+    LongTermMemory,
+    Message,
+    MessageEmbedding,
+    ModelState,
+    PinnedMemory,
+    StreamingCheckpoint,
+    ToolState,
+    Topic,
+)
 from src.sync.consistency import topic_transaction
 
 
@@ -20,6 +31,12 @@ class TopicKey:
 
 
 class TopicSessionManager:
+    @staticmethod
+    def _scope_for_key(key: TopicKey) -> tuple[str, str]:
+        if key.chat_id > 0 and key.message_thread_id == 0:
+            return "private", f"private:{key.chat_id}"
+        return "topic", f"topic:{key.chat_id}:{key.message_thread_id}"
+
     def get_or_create_topic(self, key: TopicKey) -> Topic:
         with topic_transaction(key.value) as db:
             stmt = select(Topic).where(
@@ -151,6 +168,39 @@ class TopicSessionManager:
             for row in tools:
                 db.delete(row)
 
+            scope_type, scope_id = self._scope_for_key(key)
+
+            summary_stmt = select(ConversationSummary).where(
+                ConversationSummary.scope_type == scope_type,
+                ConversationSummary.scope_id == scope_id,
+            )
+            summaries = db.execute(summary_stmt).scalars().all()
+            for row in summaries:
+                db.delete(row)
+
+            pinned_stmt = select(PinnedMemory).where(
+                PinnedMemory.scope_type == scope_type,
+                PinnedMemory.scope_id == scope_id,
+            )
+            pinned = db.execute(pinned_stmt).scalars().all()
+            for row in pinned:
+                db.delete(row)
+
+            embedding_stmt = select(MessageEmbedding).where(
+                MessageEmbedding.scope_type == scope_type,
+                MessageEmbedding.scope_id == scope_id,
+            )
+            embeddings = db.execute(embedding_stmt).scalars().all()
+            for row in embeddings:
+                db.delete(row)
+
+            long_term: list[LongTermMemory] = []
+            if scope_type == "private":
+                long_stmt = select(LongTermMemory).where(LongTermMemory.user_id == key.chat_id)
+                long_term = db.execute(long_stmt).scalars().all()
+                for row in long_term:
+                    db.delete(row)
+
             summary_cleared = 1 if topic.summary else 0
             topic.summary = ""
             db.add(topic)
@@ -161,6 +211,10 @@ class TopicSessionManager:
                 "jobs": len(jobs),
                 "tools": len(tools),
                 "summary": summary_cleared,
+                "scope_summaries": len(summaries),
+                "pinned": len(pinned),
+                "embeddings": len(embeddings),
+                "long_term": len(long_term),
             }
 
     def topic_message_count(self, key: TopicKey) -> int:

@@ -113,9 +113,25 @@ def _private_topic_key_from_message(message: Message) -> TopicKey | None:
 
 
 async def _ensure_ai_permission(message: Message) -> bool:
+    is_private = message.chat.type == "private"
     user_id = message.from_user.id if message.from_user else None
-    if user_id is None or user_id not in settings.allowed_user_ids:
-        await message.answer("❌ 无权限使用 AI（仅限 TELEGRAM_ALLOWED_USER_IDS 中的用户）")
+
+    if is_private:
+        if user_id is None or user_id not in settings.allowed_user_ids:
+            await message.answer("❌ 私聊无权限（仅限 TELEGRAM_ALLOWED_USER_IDS 中的用户）")
+            return False
+        return True
+
+    if settings.allowed_chat_ids and message.chat.id in settings.allowed_chat_ids:
+        return True
+
+    if user_id is not None and user_id in settings.allowed_user_ids:
+        return True
+
+    if settings.allowed_chat_ids:
+        await message.answer("❌ 此群组未被授权使用此机器人")
+    else:
+        await message.answer("❌ 无权限使用 AI（请配置 TELEGRAM_ALLOWED_CHAT_IDS 或 TELEGRAM_ALLOWED_USER_IDS）")
         return False
     return True
 
@@ -260,6 +276,10 @@ async def on_new(message: Message) -> None:
             "🧹 私聊记忆已清空\n"
             f"- 清理消息: {changed.get('messages', 0)} 条\n"
             f"- 清理总结: {changed.get('summary', 0)} 条\n"
+            f"- 清理结构化摘要: {changed.get('scope_summaries', 0)} 条\n"
+            f"- 清理钉住内容: {changed.get('pinned', 0)} 条\n"
+            f"- 清理向量: {changed.get('embeddings', 0)} 条\n"
+            f"- 清理长期记忆: {changed.get('long_term', 0)} 条\n"
             f"- 清理检查点: {changed.get('checkpoints', 0)} 条\n"
             f"- 清理任务: {changed.get('jobs', 0)} 条"
         )
@@ -558,9 +578,6 @@ async def on_text(message: Message) -> None:
 
     is_private = _is_private_chat(message)
     is_default_topic = message.message_thread_id is None or message.message_thread_id == 0
-    if not is_private and settings.allowed_chat_ids and message.chat.id not in settings.allowed_chat_ids:
-        await message.answer("❌ 此群组未被授权使用此机器人")
-        return
 
     if is_private:
         incoming_text = (message.text or "").strip()
@@ -642,9 +659,6 @@ async def on_photo(message: Message) -> None:
     if not await _ensure_ai_permission(message):
         return
     if message.message_thread_id is None or message.message_thread_id == 0:
-        return
-    if settings.allowed_chat_ids and message.chat.id not in settings.allowed_chat_ids:
-        await message.answer("❌ 此群组未被授权使用此机器人")
         return
 
     caption = (message.caption or "").strip()
