@@ -950,15 +950,21 @@ async def _run_generation(
     is_topic_controls = reply_markup is None
     started_at = monotonic()
     header = f"🤖 模型: {route.model}\n📋 原因: {route.reason}\n\n"
+
+    # Initial message: only degrade to plain text on Markdown parse errors,
+    # not on any TelegramBadRequest (which would make subsequent edits invisible).
+    initial_text = header + "⌛️ 思考中,用时: 0 s\n⚒️ 调用工具：0 次"
     try:
         sent = await message.answer(
-            header + f"⏳ 思考中... {_format_elapsed(monotonic() - started_at)}",
+            initial_text,
             reply_markup=active_reply_markup,
             parse_mode="Markdown",
         )
-    except TelegramBadRequest:
+    except TelegramBadRequest as exc:
+        if "parse entities" not in str(exc).lower():
+            raise
         sent = await message.answer(
-            header + f"⏳ 思考中... {_format_elapsed(monotonic() - started_at)}",
+            initial_text,
             reply_markup=active_reply_markup,
         )
 
@@ -975,23 +981,50 @@ async def _run_generation(
         chat_id=message.chat.id,
         message_thread_id=topic_key.message_thread_id,
         assistant_message_id=sent.message_id,
-        latest_render_text=header + f"⏳ 思考中... {_format_elapsed(monotonic() - started_at)}",
+        latest_render_text=initial_text,
         latest_answer_text="",
         is_topic_controls=is_topic_controls,
     )
 
-    tool_status = ""
     tool_call_count = 0
+    # built_answer: clean model text (chunks only) – persisted to DB and used for /re
+    built_answer = ""
+    # rendered_answer: built_answer + injected tool code-blocks – displayed to user
+    rendered_answer = ""
+    # whether a ```工具 block is currently open in rendered_answer
+    tool_block_open = False
+
+    def _build_stats(generating: bool) -> str:
+        elapsed = _format_elapsed(monotonic() - started_at)
+        if generating:
+            return f"⌛️ 思考中,用时: {elapsed}\n⚒️ 调用工具：{tool_call_count} 次\n\n"
+        return f"⌛️ 用时：{elapsed}\n⚒️ 调用工具：{tool_call_count} 次\n\n"
 
     def _current_stream_render() -> str:
-        parts: list[str] = [header]
-        if tool_status:
-            parts.append(tool_status + "\n\n")
-        parts.append(built_answer or f"⏳ 思考中... {_format_elapsed(monotonic() - started_at)}")
-        return _clip_stream_render("".join(parts))
+        stats = _build_stats(generating=True)
+        body = rendered_answer.lstrip("\n") if rendered_answer else ""
+        return _clip_stream_render(header + stats + body)
+
+    def _tool_start_label(tool_name: str, display_query: str) -> str:
+        if tool_name == "search":
+            return f"🛠️ 正在联网搜索：{display_query}" if display_query else "🛠️ 正在联网搜索..."
+        if tool_name == "fetch_webpage":
+            return f"🛠️ 正在抓取网页：{display_query}" if display_query else "🛠️ 正在抓取网页内容..."
+        if tool_name in {"", "undefined", "unknown_tool"}:
+            return "🛠️ 正在调用工具：未知工具"
+        return f"🛠️ 正在调用工具：{tool_name}（{display_query}）" if display_query else f"🛠️ 正在调用工具：{tool_name}"
+
+    def _tool_done_label(tool_name: str, display_query: str) -> str:
+        if tool_name == "search":
+            return f"✅ 联网搜索完成（{display_query}）" if display_query else "✅ 联网搜索完成"
+        if tool_name == "fetch_webpage":
+            return "✅ 网页抓取完成"
+        if tool_name in {"", "undefined", "unknown_tool"}:
+            return "✅ 工具调用完成"
+        return f"✅ 工具 {tool_name} 调用完成"
 
     async def _tool_event_to_chat(event: str) -> None:
-        nonlocal tool_status, tool_call_count
+        nonlocal tool_call_count, rendered_answer, tool_block_open
         parts = event.split(":", maxsplit=2)
         action = parts[0] if parts else ""
         tool_name = parts[1].strip() if len(parts) > 1 else ""
@@ -999,17 +1032,13 @@ async def _run_generation(
         display_query = _compact_query_for_status(tool_query) if tool_query else ""
         if action == "start":
             tool_call_count += 1
-            if tool_name == "search":
-                if display_query:
-                    tool_status = f"🛠️ 正在联网搜索：{display_query}"
-                else:
-                    tool_status = "🛠️ 正在调用工具：联网搜索..."
-            elif tool_name in {"", "undefined", "unknown_tool"}:
-                tool_status = "🛠️ 正在调用工具：未知工具"
-            elif tool_name == "fetch_webpage":
-                tool_status = "🛠️ 正在抓取网页内容..."
-            else:
-                tool_status = f"🛠️ 正在调用工具：{tool_name}"
+            label = _tool_start_label(tool_name, display_query)
+            # Close any previously unclosed block defensively
+            if tool_block_open:
+                rendered_answer += "```\n\n"
+                tool_block_open = False
+            rendered_answer += f"\n\n```工具\n{label}\n"
+            tool_block_open = True
             current = _current_stream_render()
             snapshot = runtime.active_stream_snapshots.get(topic_key.value)
             if snapshot is not None:
@@ -1018,17 +1047,12 @@ async def _run_generation(
                 return
             await _safe_edit_markdown(sent, current, reply_markup=active_reply_markup)
         elif action == "done":
-            if tool_name == "search":
-                if display_query:
-                    tool_status = f"✅ 联网搜索完成（{display_query}），正在生成最终回答..."
-                else:
-                    tool_status = "✅ 联网搜索完成，正在生成最终回答..."
-            elif tool_name == "fetch_webpage":
-                tool_status = "✅ 网页抓取完成，正在生成最终回答..."
-            elif tool_name in {"", "undefined", "unknown_tool"}:
-                tool_status = "✅ 工具调用完成，正在生成最终回答..."
+            label = _tool_done_label(tool_name, display_query)
+            if tool_block_open:
+                rendered_answer += f"{label}\n```\n\n"
+                tool_block_open = False
             else:
-                tool_status = f"✅ 工具 {tool_name} 调用完成，正在生成最终回答..."
+                rendered_answer += f"\n{label}\n\n"
             current = _current_stream_render()
             snapshot = runtime.active_stream_snapshots.get(topic_key.value)
             if snapshot is not None:
@@ -1038,7 +1062,6 @@ async def _run_generation(
             await _safe_edit_markdown(sent, current, reply_markup=active_reply_markup)
 
     last_edit = monotonic()
-    built_answer = ""
     stop_reason = "completed"
     thinking_timer_stop = asyncio.Event()
 
@@ -1083,6 +1106,7 @@ async def _run_generation(
                 stop_reason = "user_takeover"
                 break
             built_answer += chunk
+            rendered_answer += chunk
             snapshot = runtime.active_stream_snapshots.get(topic_key.value)
             if snapshot is not None:
                 snapshot.latest_answer_text = built_answer
@@ -1118,6 +1142,8 @@ async def _run_generation(
                 f"⚠️ 当前模型通道不可用，已自动切换到: {fallback_model}\n\n"
             )
             built_answer = ""
+            rendered_answer = ""
+            tool_block_open = False
             stop_reason = "completed"
             try:
                 async for chunk in provider.stream_generate(
@@ -1141,6 +1167,7 @@ async def _run_generation(
                         stop_reason = "user_takeover"
                         break
                     built_answer += chunk
+                    rendered_answer += chunk
                     snapshot = runtime.active_stream_snapshots.get(topic_key.value)
                     if snapshot is not None:
                         snapshot.latest_answer_text = built_answer
@@ -1157,27 +1184,42 @@ async def _run_generation(
                         last_edit = now
             except Exception as fallback_exc:  # noqa: BLE001
                 stop_reason = "error"
-                built_answer += f"\n\n❌ 错误: {type(fallback_exc).__name__}: {fallback_exc}"
+                err_suffix = f"\n\n❌ 错误: {type(fallback_exc).__name__}: {fallback_exc}"
+                built_answer += err_suffix
+                rendered_answer += err_suffix
         else:
             stop_reason = "error"
-            built_answer += f"\n\n❌ 错误: {type(exc).__name__}: {exc}"
+            err_suffix = f"\n\n❌ 错误: {type(exc).__name__}: {exc}"
+            built_answer += err_suffix
+            rendered_answer += err_suffix
     finally:
         thinking_timer_stop.set()
         await thinking_timer_task
         generation_control.end(topic_key.value)
 
+    # Close any dangling tool block before final render
+    if tool_block_open:
+        rendered_answer += "```\n\n"
+        tool_block_open = False
+
     reasoning_text = "route_decision -> stream_generate"
     reasoning_raw = provider._last_reasoning_content or reasoning_text
     reasoning = post_process_reasoning(settings.reasoning_mode, reasoning_raw)
+
+    # final_text is the clean model output stored in DB and used for /re refresh
     final_text = built_answer or "(无响应：上游模型返回空正文，请切换模型或查看日志)"
+    # final_rendered_body is what the user sees (includes tool blocks)
+    final_rendered_body = rendered_answer.lstrip("\n") or "(无响应：上游模型返回空正文，请切换模型或查看日志)"
     if stop_reason == "user_stop":
         final_text += "\n\n⏹️ 已停止"
+        final_rendered_body += "\n\n⏹️ 已停止"
     elif stop_reason == "error":
         final_text += "\n\n（含错误）"
+        final_rendered_body += "\n\n（含错误）"
 
     total_elapsed = _format_elapsed(monotonic() - started_at)
-    stats_text = f"⌛️ 用时：{total_elapsed}\n⚒️ 调用工具：{tool_call_count} 次\n\n"
-    final_render = header + stats_text + final_text
+    stats_final = f"⌛️ 用时：{total_elapsed}\n⚒️ 调用工具：{tool_call_count} 次\n\n"
+    final_render = header + stats_final + final_rendered_body
     snapshot = runtime.active_stream_snapshots.get(topic_key.value)
     if snapshot is not None:
         snapshot.latest_answer_text = final_text
@@ -1186,10 +1228,11 @@ async def _run_generation(
         runtime.active_stream_snapshots.pop(topic_key.value, None)
         return
 
+    # Use final_text (clean) for overflow detection so the txt file is also clean
     preview, overflow = _split_preview_and_tail(final_text)
     if overflow:
         preview_body = _truncate_with_dynamic_omission(final_text, PREVIEW_CHARS_ON_OVERFLOW, "消息较长，已经放入txt请查看txt文件")
-        short_render = header + stats_text + preview_body
+        short_render = header + stats_final + preview_body
         await _safe_edit_markdown(sent, short_render, retry_on_flood=True, reply_markup=active_reply_markup)
         await _send_tail_as_txt(message, topic_key, final_text)
     else:
