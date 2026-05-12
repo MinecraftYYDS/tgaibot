@@ -780,18 +780,41 @@ async def on_ping(message: Message) -> None:
     concurrency = min(batch_size, len(models))
 
     results: dict[str, bool | None] = {m.id: None for m in models}
-    status_msg = await message.answer(_build_ping_text(models, results))
+    last_rendered_text = _build_ping_text(models, results)
+    status_msg = await message.answer(last_rendered_text)
 
     pending_models = iter(models)
     pending_lock = asyncio.Lock()
     in_progress_ids: set[str] = set()
     progress_lock = asyncio.Lock()
 
+    async def _edit_status_text(text: str, retry_on_flood: bool = False) -> bool:
+        attempts = 4 if retry_on_flood else 1
+        for attempt in range(attempts):
+            try:
+                await status_msg.edit_text(text)
+                return True
+            except TelegramRetryAfter as exc:
+                if retry_on_flood and attempt < attempts - 1:
+                    await asyncio.sleep(exc.retry_after)
+                    continue
+                return False
+            except TelegramBadRequest as exc:
+                err = str(exc).lower()
+                if "message is not modified" in err:
+                    return True
+                if "message to edit not found" in err or "message can't be edited" in err:
+                    return False
+                return False
+        return False
+
     async def _try_edit_status() -> None:
-        try:
-            await status_msg.edit_text(_build_ping_text(models, results, in_progress_ids=in_progress_ids))
-        except (TelegramBadRequest, TelegramRetryAfter):
-            pass
+        nonlocal last_rendered_text
+        text = _build_ping_text(models, results, in_progress_ids=in_progress_ids)
+        if text == last_rendered_text:
+            return
+        if await _edit_status_text(text):
+            last_rendered_text = text
 
     async def _worker() -> None:
         while True:
@@ -821,10 +844,14 @@ async def on_ping(message: Message) -> None:
     from src.bot import runtime as _rt
     _rt.failed_ping_models = {m_id for m_id, ok in results.items() if ok is False}
 
-    try:
-        await status_msg.edit_text(_build_ping_text(models, results, finished=True))
-    except (TelegramBadRequest, TelegramRetryAfter):
-        pass
+    in_progress_ids.clear()
+    final_text = _build_ping_text(models, results, finished=True)
+    final_updated = await _edit_status_text(final_text, retry_on_flood=True)
+    if final_updated:
+        last_rendered_text = final_text
+    else:
+        # Ensure users always see completion even if status message editing fails.
+        await message.answer(final_text)
 
 
 @router.message(F.text)
