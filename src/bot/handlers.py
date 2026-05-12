@@ -987,8 +987,9 @@ async def _run_generation(
     )
 
     tool_call_count = 0
-    # display_parts: render timeline (text chunks + tool events) in arrival order
-    display_parts: list[str] = []
+    # display_segments: timeline segments in arrival order.
+    # segment format: {"type": "text", "value": str} or {"type": "tool", "lines": list[str]}
+    display_segments: list[dict[str, object]] = []
     # built_answer: clean model text (chunks only) – persisted to DB and used for /re
     built_answer = ""
 
@@ -998,9 +999,40 @@ async def _run_generation(
             return f"⌛️ 思考中,用时: {elapsed}\n⚒️ 调用工具：{tool_call_count} 次\n\n"
         return f"⌛️ 用时：{elapsed}\n⚒️ 调用工具：{tool_call_count} 次\n\n"
 
+    def _append_text_segment(text: str) -> None:
+        if not text:
+            return
+        if display_segments and display_segments[-1].get("type") == "text":
+            prev = display_segments[-1].get("value", "")
+            display_segments[-1]["value"] = f"{prev}{text}"
+            return
+        display_segments.append({"type": "text", "value": text})
+
+    def _append_tool_line(line: str) -> None:
+        if display_segments and display_segments[-1].get("type") == "tool":
+            lines = display_segments[-1].get("lines")
+            if isinstance(lines, list):
+                lines.append(line)
+                return
+        display_segments.append({"type": "tool", "lines": [line]})
+
+    def _render_display_segments() -> str:
+        if not display_segments:
+            return ""
+        parts: list[str] = []
+        for segment in display_segments:
+            seg_type = segment.get("type")
+            if seg_type == "text":
+                parts.append(str(segment.get("value", "")))
+            elif seg_type == "tool":
+                lines = segment.get("lines")
+                if isinstance(lines, list) and lines:
+                    parts.append("\n```工具\n" + "".join(lines) + "```\n")
+        return "".join(parts)
+
     def _current_stream_render() -> str:
         stats = _build_stats(generating=True)
-        body = "".join(display_parts).lstrip("\n") if display_parts else ""
+        body = _render_display_segments().lstrip("\n")
         return _clip_stream_render(header + stats + body)
 
     def _tool_start_label(tool_name: str, display_query: str) -> str:
@@ -1031,10 +1063,10 @@ async def _run_generation(
         if action == "start":
             tool_call_count += 1
             label = _tool_start_label(tool_name, display_query)
-            display_parts.append(f"\n```工具\n{label}\n```\n")
+            _append_tool_line(label + "\n")
         elif action == "done":
             label = _tool_done_label(tool_name, display_query)
-            display_parts.append(f"\n```工具\n{label}\n```\n")
+            _append_tool_line(label + "\n")
         else:
             return
         current = _current_stream_render()
@@ -1090,7 +1122,7 @@ async def _run_generation(
                 stop_reason = "user_takeover"
                 break
             built_answer += chunk
-            display_parts.append(chunk)
+            _append_text_segment(chunk)
             snapshot = runtime.active_stream_snapshots.get(topic_key.value)
             if snapshot is not None:
                 snapshot.latest_answer_text = built_answer
@@ -1126,7 +1158,7 @@ async def _run_generation(
                 f"⚠️ 当前模型通道不可用，已自动切换到: {fallback_model}\n\n"
             )
             built_answer = ""
-            display_parts.clear()
+            display_segments.clear()
             tool_call_count = 0
             stop_reason = "completed"
             try:
@@ -1151,7 +1183,7 @@ async def _run_generation(
                         stop_reason = "user_takeover"
                         break
                     built_answer += chunk
-                    display_parts.append(chunk)
+                    _append_text_segment(chunk)
                     snapshot = runtime.active_stream_snapshots.get(topic_key.value)
                     if snapshot is not None:
                         snapshot.latest_answer_text = built_answer
@@ -1195,7 +1227,7 @@ async def _run_generation(
 
     total_elapsed = _format_elapsed(monotonic() - started_at)
     stats_final = f"⌛️ 用时：{total_elapsed}\n⚒️ 调用工具：{tool_call_count} 次\n\n"
-    timeline_body = "".join(display_parts).lstrip("\n") if display_parts else ""
+    timeline_body = _render_display_segments().lstrip("\n")
     final_rendered_body = (timeline_body + final_render_suffix) if timeline_body else final_text
     final_render = header + stats_final + final_rendered_body
     snapshot = runtime.active_stream_snapshots.get(topic_key.value)
