@@ -987,12 +987,10 @@ async def _run_generation(
     )
 
     tool_call_count = 0
+    # display_parts: render timeline (text chunks + tool events) in arrival order
+    display_parts: list[str] = []
     # built_answer: clean model text (chunks only) – persisted to DB and used for /re
     built_answer = ""
-    # rendered_answer: built_answer + injected tool code-blocks – displayed to user
-    rendered_answer = ""
-    # whether a ```工具 block is currently open in rendered_answer
-    tool_block_open = False
 
     def _build_stats(generating: bool) -> str:
         elapsed = _format_elapsed(monotonic() - started_at)
@@ -1002,7 +1000,7 @@ async def _run_generation(
 
     def _current_stream_render() -> str:
         stats = _build_stats(generating=True)
-        body = rendered_answer.lstrip("\n") if rendered_answer else ""
+        body = "".join(display_parts).lstrip("\n") if display_parts else ""
         return _clip_stream_render(header + stats + body)
 
     def _tool_start_label(tool_name: str, display_query: str) -> str:
@@ -1024,7 +1022,7 @@ async def _run_generation(
         return f"✅ 工具 {tool_name} 调用完成"
 
     async def _tool_event_to_chat(event: str) -> None:
-        nonlocal tool_call_count, rendered_answer, tool_block_open
+        nonlocal tool_call_count
         parts = event.split(":", maxsplit=2)
         action = parts[0] if parts else ""
         tool_name = parts[1].strip() if len(parts) > 1 else ""
@@ -1033,33 +1031,19 @@ async def _run_generation(
         if action == "start":
             tool_call_count += 1
             label = _tool_start_label(tool_name, display_query)
-            # Close any previously unclosed block defensively
-            if tool_block_open:
-                rendered_answer += "```\n\n"
-                tool_block_open = False
-            rendered_answer += f"\n\n```工具\n{label}\n"
-            tool_block_open = True
-            current = _current_stream_render()
-            snapshot = runtime.active_stream_snapshots.get(topic_key.value)
-            if snapshot is not None:
-                snapshot.latest_render_text = current
-            if _taken_over_by_user():
-                return
-            await _safe_edit_markdown(sent, current, reply_markup=active_reply_markup)
+            display_parts.append(f"\n```工具\n{label}\n```\n")
         elif action == "done":
             label = _tool_done_label(tool_name, display_query)
-            if tool_block_open:
-                rendered_answer += f"{label}\n```\n\n"
-                tool_block_open = False
-            else:
-                rendered_answer += f"\n{label}\n\n"
-            current = _current_stream_render()
-            snapshot = runtime.active_stream_snapshots.get(topic_key.value)
-            if snapshot is not None:
-                snapshot.latest_render_text = current
-            if _taken_over_by_user():
-                return
-            await _safe_edit_markdown(sent, current, reply_markup=active_reply_markup)
+            display_parts.append(f"\n```工具\n{label}\n```\n")
+        else:
+            return
+        current = _current_stream_render()
+        snapshot = runtime.active_stream_snapshots.get(topic_key.value)
+        if snapshot is not None:
+            snapshot.latest_render_text = current
+        if _taken_over_by_user():
+            return
+        await _safe_edit_markdown(sent, current, reply_markup=active_reply_markup)
 
     last_edit = monotonic()
     stop_reason = "completed"
@@ -1106,7 +1090,7 @@ async def _run_generation(
                 stop_reason = "user_takeover"
                 break
             built_answer += chunk
-            rendered_answer += chunk
+            display_parts.append(chunk)
             snapshot = runtime.active_stream_snapshots.get(topic_key.value)
             if snapshot is not None:
                 snapshot.latest_answer_text = built_answer
@@ -1142,8 +1126,8 @@ async def _run_generation(
                 f"⚠️ 当前模型通道不可用，已自动切换到: {fallback_model}\n\n"
             )
             built_answer = ""
-            rendered_answer = ""
-            tool_block_open = False
+            display_parts.clear()
+            tool_call_count = 0
             stop_reason = "completed"
             try:
                 async for chunk in provider.stream_generate(
@@ -1167,7 +1151,7 @@ async def _run_generation(
                         stop_reason = "user_takeover"
                         break
                     built_answer += chunk
-                    rendered_answer += chunk
+                    display_parts.append(chunk)
                     snapshot = runtime.active_stream_snapshots.get(topic_key.value)
                     if snapshot is not None:
                         snapshot.latest_answer_text = built_answer
@@ -1186,21 +1170,14 @@ async def _run_generation(
                 stop_reason = "error"
                 err_suffix = f"\n\n❌ 错误: {type(fallback_exc).__name__}: {fallback_exc}"
                 built_answer += err_suffix
-                rendered_answer += err_suffix
         else:
             stop_reason = "error"
             err_suffix = f"\n\n❌ 错误: {type(exc).__name__}: {exc}"
             built_answer += err_suffix
-            rendered_answer += err_suffix
     finally:
         thinking_timer_stop.set()
         await thinking_timer_task
         generation_control.end(topic_key.value)
-
-    # Close any dangling tool block before final render
-    if tool_block_open:
-        rendered_answer += "```\n\n"
-        tool_block_open = False
 
     reasoning_text = "route_decision -> stream_generate"
     reasoning_raw = provider._last_reasoning_content or reasoning_text
@@ -1208,17 +1185,18 @@ async def _run_generation(
 
     # final_text is the clean model output stored in DB and used for /re refresh
     final_text = built_answer or "(无响应：上游模型返回空正文，请切换模型或查看日志)"
-    # final_rendered_body is what the user sees (includes tool blocks)
-    final_rendered_body = rendered_answer.lstrip("\n") or "(无响应：上游模型返回空正文，请切换模型或查看日志)"
+    final_render_suffix = ""
     if stop_reason == "user_stop":
         final_text += "\n\n⏹️ 已停止"
-        final_rendered_body += "\n\n⏹️ 已停止"
+        final_render_suffix = "\n\n⏹️ 已停止"
     elif stop_reason == "error":
         final_text += "\n\n（含错误）"
-        final_rendered_body += "\n\n（含错误）"
+        final_render_suffix = "\n\n（含错误）"
 
     total_elapsed = _format_elapsed(monotonic() - started_at)
     stats_final = f"⌛️ 用时：{total_elapsed}\n⚒️ 调用工具：{tool_call_count} 次\n\n"
+    timeline_body = "".join(display_parts).lstrip("\n") if display_parts else ""
+    final_rendered_body = (timeline_body + final_render_suffix) if timeline_body else final_text
     final_render = header + stats_final + final_rendered_body
     snapshot = runtime.active_stream_snapshots.get(topic_key.value)
     if snapshot is not None:
