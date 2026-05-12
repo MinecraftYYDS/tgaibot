@@ -228,13 +228,13 @@ class LLMProvider:
                 tool_name, argument, search_query = self._parse_tool_call(name, parsed_args)
                 logger.debug(f"[tool-execute] name={tool_name} argument={repr(argument[:50] if len(argument) > 50 else argument)}")
                 if on_tool_event is not None:
-                    event_msg = f"start:{tool_name}:{search_query}" if search_query else f"start:{tool_name}"
+                    event_msg = f"start:{tool_name}:{search_query}" if tool_name == "search" else f"start:{tool_name}"
                     logger.debug(f"[tool-event-callback] sending={repr(event_msg)}")
                     await on_tool_event(event_msg)
                 tool_result = await execute_builtin_tool_with_context(tool_name, argument, tool_context)
                 logger.debug(f"[tool-result] {tool_name}={repr(tool_result[:100] if len(tool_result) > 100 else tool_result)}")
                 if on_tool_event is not None:
-                    event_msg = f"done:{tool_name}:{search_query}" if search_query else f"done:{tool_name}"
+                    event_msg = f"done:{tool_name}:{search_query}" if tool_name == "search" else f"done:{tool_name}"
                     logger.debug(f"[tool-event-callback] sending={repr(event_msg)}")
                     await on_tool_event(event_msg)
                 tool_call_id = str(tool_call.get("id") or "") if isinstance(tool_call, dict) else ""
@@ -647,12 +647,12 @@ class LLMProvider:
                 tool_name, argument, search_query = self._parse_tool_call(name, parsed_args)
                 logger.debug(f"[stream-tool-execute] name={tool_name} argument={repr(argument[:50])}")
                 if on_tool_event is not None:
-                    event_msg = f"start:{tool_name}:{search_query}" if search_query else f"start:{tool_name}"
+                    event_msg = f"start:{tool_name}:{search_query}" if tool_name == "search" else f"start:{tool_name}"
                     await on_tool_event(event_msg)
                 tool_result = await execute_builtin_tool_with_context(tool_name, argument, tool_context)
                 logger.debug(f"[stream-tool-result] {tool_name}={repr(tool_result[:100])}")
                 if on_tool_event is not None:
-                    event_msg = f"done:{tool_name}:{search_query}" if search_query else f"done:{tool_name}"
+                    event_msg = f"done:{tool_name}:{search_query}" if tool_name == "search" else f"done:{tool_name}"
                     await on_tool_event(event_msg)
                 tool_call_id = str(tool_call.get("id") or "") if isinstance(tool_call, dict) else ""
                 messages.append({
