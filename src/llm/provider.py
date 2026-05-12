@@ -65,6 +65,10 @@ class LLMProvider:
                         context_messages=context_messages or [],
                         image_bytes=image_bytes,
                         image_mime_type=image_mime_type,
+                        tools=self._build_tools(),
+                        tool_choice="auto",
+                        on_tool_event=on_tool_event,
+                        tool_context=tool_context,
                     ):
                         yield chunk
                     return
@@ -103,6 +107,10 @@ class LLMProvider:
                     context_messages=context_messages or [],
                     image_bytes=image_bytes,
                     image_mime_type=image_mime_type,
+                    tools=self._build_tools(),
+                    tool_choice="auto",
+                    on_tool_event=on_tool_event,
+                    tool_context=tool_context,
                 ):
                     yield chunk
                 return
@@ -159,79 +167,7 @@ class LLMProvider:
             image_mime_type=image_mime_type,
         )
 
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "search",
-                    "description": "联网搜索最新信息并返回摘要。适合实时资讯、新闻、需要来源链接的问题。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "query": {"type": "string", "description": "搜索关键词"},
-                            "max_results": {"type": "integer", "description": "结果条数，1-10", "default": 5},
-                        },
-                        "required": ["query"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "time_now",
-                    "description": "获取当前 UTC 时间。",
-                    "parameters": {"type": "object", "properties": {}, "required": []},
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "fetch_webpage",
-                    "description": "抓取网页内容并返回可读文本摘要，适合需要精读指定 URL 的场景。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "url": {"type": "string", "description": "完整网页 URL"},
-                            "max_chars": {"type": "integer", "description": "返回文本最大长度", "default": 5000},
-                        },
-                        "required": ["url"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "echo",
-                    "description": "原样返回输入内容，用于调试。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"text": {"type": "string", "description": "要回显的文本"}},
-                        "required": ["text"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "memory_add",
-                    "description": "将关键信息写入记忆。私聊默认写长期记忆，群聊/话题默认写钉住记忆。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "text": {"type": "string", "description": "需要写入记忆的内容"},
-                            "kind": {
-                                "type": "string",
-                                "description": "记忆类型：auto/long_term/pinned",
-                                "enum": ["auto", "long_term", "pinned"],
-                                "default": "auto",
-                            },
-                            "importance": {"type": "integer", "description": "长期记忆重要度 1-10", "default": 1},
-                        },
-                        "required": ["text"],
-                    },
-                },
-            },
-        ]
+        tools = self._build_tools()
 
         for iteration in range(max_iterations):
             logger.debug(f"[agentic-loop] iteration {iteration+1}/{max_iterations}")
@@ -289,44 +225,16 @@ class LLMProvider:
                 except json.JSONDecodeError:
                     parsed_args = {}
 
-                argument = ""
-                search_query = ""
-                if name in {"search", "web_search"}:
-                    query = str(parsed_args.get("query") or "").strip()
-                    max_results = int(parsed_args.get("max_results") or 5)
-                    argument = f"{query} | {max_results}"
-                    tool_name = "search"
-                    search_query = query
-                elif name == "echo":
-                    argument = str(parsed_args.get("text") or "")
-                    tool_name = "echo"
-                elif name == "time_now":
-                    tool_name = "time_now"
-                elif name in {"fetch_webpage", "web_fetch", "get_webpage"}:
-                    url = str(parsed_args.get("url") or "").strip()
-                    max_chars = int(parsed_args.get("max_chars") or 5000)
-                    argument = f"{url} | {max_chars}"
-                    tool_name = "fetch_webpage"
-                elif name in {"memory_add", "remember"}:
-                    payload = {
-                        "text": str(parsed_args.get("text") or "").strip(),
-                        "kind": str(parsed_args.get("kind") or "auto").strip(),
-                        "importance": int(parsed_args.get("importance") or 1),
-                    }
-                    argument = json.dumps(payload, ensure_ascii=False)
-                    tool_name = "memory_add"
-                else:
-                    tool_name = name if name else "unknown_tool"
-
+                tool_name, argument, search_query = self._parse_tool_call(name, parsed_args)
                 logger.debug(f"[tool-execute] name={tool_name} argument={repr(argument[:50] if len(argument) > 50 else argument)}")
                 if on_tool_event is not None:
-                    event_msg = f"start:{tool_name}:{search_query}" if tool_name == "search" else f"start:{tool_name}"
+                    event_msg = f"start:{tool_name}:{search_query}" if search_query else f"start:{tool_name}"
                     logger.debug(f"[tool-event-callback] sending={repr(event_msg)}")
                     await on_tool_event(event_msg)
                 tool_result = await execute_builtin_tool_with_context(tool_name, argument, tool_context)
                 logger.debug(f"[tool-result] {tool_name}={repr(tool_result[:100] if len(tool_result) > 100 else tool_result)}")
                 if on_tool_event is not None:
-                    event_msg = f"done:{tool_name}:{search_query}" if tool_name == "search" else f"done:{tool_name}"
+                    event_msg = f"done:{tool_name}:{search_query}" if search_query else f"done:{tool_name}"
                     logger.debug(f"[tool-event-callback] sending={repr(event_msg)}")
                     await on_tool_event(event_msg)
                 tool_call_id = str(tool_call.get("id") or "") if isinstance(tool_call, dict) else ""
@@ -458,6 +366,115 @@ class LLMProvider:
 
         return {}
 
+    @staticmethod
+    def _build_tools() -> list[dict]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "description": "联网搜索最新信息并返回摘要。适合实时资讯、新闻、需要来源链接的问题。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "搜索关键词"},
+                            "max_results": {"type": "integer", "description": "结果条数，1-10", "default": 5},
+                        },
+                        "required": ["query"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "time_now",
+                    "description": "获取当前 UTC 时间。",
+                    "parameters": {"type": "object", "properties": {}, "required": []},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "fetch_webpage",
+                    "description": "抓取网页内容并返回可读文本摘要，适合需要精读指定 URL 的场景。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "url": {"type": "string", "description": "完整网页 URL"},
+                            "max_chars": {"type": "integer", "description": "返回文本最大长度", "default": 5000},
+                        },
+                        "required": ["url"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "echo",
+                    "description": "原样返回输入内容，用于调试。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"text": {"type": "string", "description": "要回显的文本"}},
+                        "required": ["text"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "memory_add",
+                    "description": "将关键信息写入记忆。私聊默认写长期记忆，群聊/话题默认写钉住记忆。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string", "description": "需要写入记忆的内容"},
+                            "kind": {
+                                "type": "string",
+                                "description": "记忆类型：auto/long_term/pinned",
+                                "enum": ["auto", "long_term", "pinned"],
+                                "default": "auto",
+                            },
+                            "importance": {"type": "integer", "description": "长期记忆重要度 1-10", "default": 1},
+                        },
+                        "required": ["text"],
+                    },
+                },
+            },
+        ]
+
+    @staticmethod
+    def _parse_tool_call(name: str, parsed_args: dict) -> tuple[str, str, str]:
+        """Return (tool_name, argument_str, search_query)."""
+        search_query = ""
+        argument = ""
+        if name in {"search", "web_search"}:
+            query = str(parsed_args.get("query") or "").strip()
+            max_results = int(parsed_args.get("max_results") or 5)
+            argument = f"{query} | {max_results}"
+            tool_name = "search"
+            search_query = query
+        elif name == "echo":
+            argument = str(parsed_args.get("text") or "")
+            tool_name = "echo"
+        elif name == "time_now":
+            tool_name = "time_now"
+        elif name in {"fetch_webpage", "web_fetch", "get_webpage"}:
+            url = str(parsed_args.get("url") or "").strip()
+            max_chars = int(parsed_args.get("max_chars") or 5000)
+            argument = f"{url} | {max_chars}"
+            tool_name = "fetch_webpage"
+        elif name in {"memory_add", "remember"}:
+            payload = {
+                "text": str(parsed_args.get("text") or "").strip(),
+                "kind": str(parsed_args.get("kind") or "auto").strip(),
+                "importance": int(parsed_args.get("importance") or 1),
+            }
+            argument = json.dumps(payload, ensure_ascii=False)
+            tool_name = "memory_add"
+        else:
+            tool_name = name if name else "unknown_tool"
+        return tool_name, argument, search_query
+
     def _build_messages(
         self,
         prompt: str,
@@ -469,9 +486,15 @@ class LLMProvider:
             {
                 "role": "system",
                 "content": (
-                    "你是一个有帮助的AI助手。请用中文回答用户的问题。尽可能简洁、准确、有用。"
-                    "当用户明确给出稳定偏好、长期约束或关键事实时，可调用 memory_add 工具写入记忆；"
-                    "私聊优先写长期记忆，群话题优先写钉住记忆。"
+                    "你是一个有帮助的AI助手。请用中文回答用户的问题。尽可能简洁、准确、有用。\n"
+                    "你拥有以下工具可以调用：\n"
+                    "- search：联网搜索实时信息\n"
+                    "- fetch_webpage：抓取指定网页内容\n"
+                    "- time_now：获取当前 UTC 时间\n"
+                    "- memory_add：将关键信息写入记忆（私聊写长期记忆，群话题写钉住记忆）\n"
+                    "- echo：原样回显文本（调试用）\n"
+                    "需要实时信息或访问网页时请主动调用相应工具；"
+                    "当用户明确给出稳定偏好、长期约束或关键事实时，调用 memory_add 写入记忆。"
                 ),
             },
         ]
@@ -507,6 +530,11 @@ class LLMProvider:
         context_messages: list[dict] | None = None,
         image_bytes: bytes | None = None,
         image_mime_type: str = "image/jpeg",
+        tools: list[dict] | None = None,
+        tool_choice: str | None = None,
+        on_tool_event: Callable[[str], Awaitable[None]] | None = None,
+        tool_context: dict[str, object] | None = None,
+        max_iterations: int = 5,
     ) -> AsyncIterator[str]:
         base_url = profile_base_url.rstrip("/") if profile_base_url else "https://api.openai.com/v1"
         endpoint = f"{base_url}/chat/completions"
@@ -514,48 +542,130 @@ class LLMProvider:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
-        payload = {
-            "model": profile_model_name,
-            "messages": self._build_messages(
-                prompt=prompt,
-                context_messages=context_messages,
-                image_bytes=image_bytes,
-                image_mime_type=image_mime_type,
-            ),
-            "stream": True,
-        }
+        messages = self._build_messages(
+            prompt=prompt,
+            context_messages=context_messages,
+            image_bytes=image_bytes,
+            image_mime_type=image_mime_type,
+        )
 
         collected_reasoning: list[str] = []
         got_text = False
-        async with httpx.AsyncClient(timeout=settings.provider_timeout_seconds) as client:
-            async with client.stream("POST", endpoint, headers=headers, json=payload) as response:
-                if response.status_code >= 400:
-                    error_text = (await response.aread()).decode("utf-8", errors="ignore").strip()
-                    raise ValueError(
-                        f"上游接口请求失败 HTTP {response.status_code}，模型={profile_model_name}，详情：{error_text or '无错误详情'}"
-                    )
-                async for raw_line in response.aiter_lines():
-                    line = (raw_line or "").strip()
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if not data or data == "[DONE]":
-                        continue
-                    try:
-                        obj = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
-                    choices = obj.get("choices") or []
-                    if not choices:
-                        continue
-                    delta = choices[0].get("delta") or {}
-                    content = delta.get("content")
-                    if isinstance(content, str) and content:
-                        got_text = True
-                        yield content
-                    reasoning_content = delta.get("reasoning_content")
-                    if isinstance(reasoning_content, str) and reasoning_content:
-                        collected_reasoning.append(reasoning_content)
+
+        for iteration in range(max_iterations + 1):
+            is_last = iteration == max_iterations
+            payload: dict[str, object] = {
+                "model": profile_model_name,
+                "messages": messages,
+                "stream": True,
+            }
+            if tools and not is_last:
+                payload["tools"] = tools
+                payload["tool_choice"] = tool_choice or "auto"
+                logger.debug(f"[stream-tools] iteration={iteration+1} tools_count={len(tools)}")
+
+            pending_tool_calls: dict[int, dict] = {}
+            assistant_content_parts: list[str] = []
+
+            async with httpx.AsyncClient(timeout=settings.provider_timeout_seconds) as client:
+                async with client.stream("POST", endpoint, headers=headers, json=payload) as response:
+                    if response.status_code >= 400:
+                        error_text = (await response.aread()).decode("utf-8", errors="ignore").strip()
+                        raise ValueError(
+                            f"上游接口请求失败 HTTP {response.status_code}，模型={profile_model_name}，详情：{error_text or '无错误详情'}"
+                        )
+                    async for raw_line in response.aiter_lines():
+                        line = (raw_line or "").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if not data or data == "[DONE]":
+                            continue
+                        try:
+                            obj = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+                        choices = obj.get("choices") or []
+                        if not choices:
+                            continue
+                        choice = choices[0]
+                        delta = choice.get("delta") or {}
+                        content = delta.get("content")
+                        if isinstance(content, str) and content:
+                            got_text = True
+                            assistant_content_parts.append(content)
+                            yield content
+                        reasoning_content = delta.get("reasoning_content")
+                        if isinstance(reasoning_content, str) and reasoning_content:
+                            collected_reasoning.append(reasoning_content)
+                        # Accumulate streaming tool call chunks
+                        tool_calls_delta = delta.get("tool_calls")
+                        if tool_calls_delta:
+                            for tc_delta in tool_calls_delta:
+                                idx = int(tc_delta.get("index") or 0)
+                                if idx not in pending_tool_calls:
+                                    pending_tool_calls[idx] = {"id": "", "name": "", "arguments": ""}
+                                tc = pending_tool_calls[idx]
+                                if tc_delta.get("id"):
+                                    tc["id"] = tc_delta["id"]
+                                fn = tc_delta.get("function") or {}
+                                if fn.get("name"):
+                                    tc["name"] += fn["name"]
+                                if fn.get("arguments"):
+                                    tc["arguments"] += fn["arguments"]
+
+            if not pending_tool_calls or is_last:
+                break
+
+            # Build assistant message with accumulated tool calls
+            assistant_content = "".join(assistant_content_parts)
+            tool_calls_list = []
+            for idx in sorted(pending_tool_calls.keys()):
+                tc = pending_tool_calls[idx]
+                tool_calls_list.append({
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                })
+            assistant_msg: dict[str, object] = {
+                "role": "assistant",
+                "content": assistant_content,
+                "tool_calls": tool_calls_list,
+            }
+            messages.append(assistant_msg)
+            logger.debug(f"[stream-tool-calls] iteration={iteration+1} count={len(tool_calls_list)}")
+
+            # Execute each tool call and append results
+            for tool_call in tool_calls_list:
+                fn = (tool_call.get("function") or {}) if isinstance(tool_call, dict) else {}
+                name = str(fn.get("name") or "").strip()
+                raw_args = str(fn.get("arguments") or "{}").strip()
+                try:
+                    parsed_args = json.loads(raw_args) if raw_args else {}
+                except json.JSONDecodeError:
+                    parsed_args = {}
+                tool_name, argument, search_query = self._parse_tool_call(name, parsed_args)
+                logger.debug(f"[stream-tool-execute] name={tool_name} argument={repr(argument[:50])}")
+                if on_tool_event is not None:
+                    event_msg = f"start:{tool_name}:{search_query}" if search_query else f"start:{tool_name}"
+                    await on_tool_event(event_msg)
+                tool_result = await execute_builtin_tool_with_context(tool_name, argument, tool_context)
+                logger.debug(f"[stream-tool-result] {tool_name}={repr(tool_result[:100])}")
+                if on_tool_event is not None:
+                    event_msg = f"done:{tool_name}:{search_query}" if search_query else f"done:{tool_name}"
+                    await on_tool_event(event_msg)
+                tool_call_id = str(tool_call.get("id") or "") if isinstance(tool_call, dict) else ""
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": tool_result,
+                })
+
+            if iteration == max_iterations - 1:
+                messages.append({
+                    "role": "user",
+                    "content": "已达到工具调用上限，请不要再调用工具，直接基于当前信息给出最终答案。",
+                })
 
         self._last_reasoning_content = "".join(collected_reasoning).strip()
         if not got_text:
