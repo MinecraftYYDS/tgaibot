@@ -777,25 +777,43 @@ async def on_ping(message: Message) -> None:
         await message.answer("⚠️ 并发数必须为正整数")
         return
 
+    concurrency = min(batch_size, len(models))
+
     results: dict[str, bool | None] = {m.id: None for m in models}
     status_msg = await message.answer(_build_ping_text(models, results))
 
-    for i in range(0, len(models), batch_size):
-        batch = models[i : i + batch_size]
-        in_progress_ids = {m.id for m in batch}
+    pending_models = iter(models)
+    pending_lock = asyncio.Lock()
+    in_progress_ids: set[str] = set()
+    progress_lock = asyncio.Lock()
+
+    async def _try_edit_status() -> None:
         try:
             await status_msg.edit_text(_build_ping_text(models, results, in_progress_ids=in_progress_ids))
         except (TelegramBadRequest, TelegramRetryAfter):
             pass
 
-        batch_results = await asyncio.gather(*(_ping_single_model(m.id) for m in batch))
-        for model, ok in zip(batch, batch_results):
-            results[model.id] = ok
+    async def _worker() -> None:
+        while True:
+            async with pending_lock:
+                model = next(pending_models, None)
+                if model is not None:
+                    in_progress_ids.add(model.id)
 
-        try:
-            await status_msg.edit_text(_build_ping_text(models, results))
-        except (TelegramBadRequest, TelegramRetryAfter):
-            pass
+            if model is None:
+                return
+
+            async with progress_lock:
+                await _try_edit_status()
+
+            ok = await _ping_single_model(model.id)
+
+            async with progress_lock:
+                in_progress_ids.discard(model.id)
+                results[model.id] = ok
+                await _try_edit_status()
+
+    await asyncio.gather(*(_worker() for _ in range(concurrency)))
 
     # Update the global failed set used by model_selection_keyboard.
     # We import the module (not the name) so the assignment mutates the
