@@ -24,7 +24,7 @@ router = Router(name="handlers")
 
 TELEGRAM_RENDER_LIMIT = 3500
 PREVIEW_CHARS_ON_OVERFLOW = 1800
-TELEGRAM_CODE_FENCE_LANG_RE = re.compile(r"```[ \t]*[A-Za-z0-9_.+-]+[ \t]*\r?\n")
+TELEGRAM_CODE_FENCE_LANG_RE = re.compile(r"```[A-Za-z0-9_.+-]+[ \t]*\r?\n")
 
 
 def _normalize_markdown_for_telegram(text: str) -> str:
