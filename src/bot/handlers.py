@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime
 from time import monotonic
 
@@ -23,6 +24,13 @@ router = Router(name="handlers")
 
 TELEGRAM_RENDER_LIMIT = 3500
 PREVIEW_CHARS_ON_OVERFLOW = 1800
+TELEGRAM_CODE_FENCE_LANG_RE = re.compile(r"```[A-Za-z0-9_.+-]+[ \t]*\r?\n")
+
+
+def _normalize_markdown_for_telegram(text: str) -> str:
+    # Telegram legacy Markdown does not reliably support fenced code language hints (```python).
+    # Strip language tags while preserving fenced blocks.
+    return TELEGRAM_CODE_FENCE_LANG_RE.sub("```\n", text)
 
 
 async def _safe_edit_markdown(
@@ -39,9 +47,10 @@ async def _safe_edit_markdown(
     """
     max_flood_attempts = 4 if retry_on_flood else 1
     keyboard = reply_markup if reply_markup is not None else control_keyboard()
+    normalized_text = _normalize_markdown_for_telegram(text)
     for flood_attempt in range(max_flood_attempts):
         try:
-            await message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+            await message.edit_text(normalized_text, reply_markup=keyboard, parse_mode="Markdown")
             return
         except TelegramRetryAfter as exc:
             if retry_on_flood and flood_attempt < max_flood_attempts - 1:
@@ -59,7 +68,7 @@ async def _safe_edit_markdown(
             if "parse entities" not in error_text:
                 raise
             try:
-                await message.edit_text(text, reply_markup=keyboard)
+                await message.edit_text(normalized_text, reply_markup=keyboard)
                 return
             except TelegramRetryAfter as fallback_retry_exc:
                 if retry_on_flood and flood_attempt < max_flood_attempts - 1:
@@ -75,6 +84,20 @@ async def _safe_edit_markdown(
                 if "message to edit not found" in fallback_text or "message can't be edited" in fallback_text:
                     return
                 raise
+
+
+async def _safe_answer_markdown(
+    message: Message,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> Message:
+    normalized_text = _normalize_markdown_for_telegram(text)
+    try:
+        return await message.answer(normalized_text, reply_markup=reply_markup, parse_mode="Markdown")
+    except TelegramBadRequest as exc:
+        if "parse entities" not in str(exc).lower():
+            raise
+        return await message.answer(normalized_text, reply_markup=reply_markup)
 
 
 def _compact_query_for_status(query: str, max_len: int = 60) -> str:
@@ -200,12 +223,12 @@ async def _send_refreshed_content(message: Message, topic_key: TopicKey, full_te
     preview, overflow = _split_preview_and_tail(full_text)
     if overflow:
         preview_text = _truncate_with_dynamic_omission(full_text, PREVIEW_CHARS_ON_OVERFLOW, "消息较长，已经放入txt请查看txt文件")
-        preview_msg = await message.answer(preview_text, reply_markup=control_keyboard())
+        preview_msg = await _safe_answer_markdown(message, preview_text, reply_markup=control_keyboard())
         from src.bot import runtime
         runtime.assistant_full_text_by_message[(topic_key.chat_id, preview_msg.message_id)] = full_text
         await _send_tail_as_txt(message, topic_key, full_text)
         return
-    preview_msg = await message.answer(preview, reply_markup=control_keyboard())
+    preview_msg = await _safe_answer_markdown(message, preview, reply_markup=control_keyboard())
     from src.bot import runtime
     runtime.assistant_full_text_by_message[(topic_key.chat_id, preview_msg.message_id)] = full_text
 
