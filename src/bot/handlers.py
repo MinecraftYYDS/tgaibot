@@ -296,7 +296,7 @@ def _build_help_text() -> str:
         "- /pin 内容：钉住当前作用域信息\n"
         "- /pins：查看当前作用域钉住内容\n"
         "- /unpin ID：取消钉住\n"
-        "- /ping：检测模型可用性（私聊或群主话题）\n"
+        "- /ping [并发数]：检测模型可用性（默认并发5，私聊或群主话题）\n"
     )
 
 
@@ -694,8 +694,10 @@ def _build_ping_text(
     models: list,
     results: dict[str, bool | None],
     finished: bool = False,
+    in_progress_ids: set[str] | None = None,
 ) -> str:
     """Build a clean progress/result text for /ping."""
+    active_ids = in_progress_ids or set()
     total = len(models)
     done_count = sum(1 for v in results.values() if v is not None)
 
@@ -712,9 +714,7 @@ def _build_ping_text(
         elif status is False:
             icon = "❌"
         else:
-            # Find the first untested model – that's the one currently running
-            untested = [m for m in models if results.get(m.id) is None]
-            icon = "⏳" if untested and untested[0].id == model.id else "⬜"
+            icon = "⏳" if model.id in active_ids else "⬜"
         lines.append(f"{icon} {model.label}")
 
     if finished:
@@ -764,12 +764,34 @@ async def on_ping(message: Message) -> None:
         await message.answer("❌ 没有可测试的模型")
         return
 
+    raw = (message.text or "").strip()
+    arg = _extract_command_argument(raw, "ping")
+    batch_size = settings.ping_parallel_batch_size
+    if arg:
+        try:
+            batch_size = int(arg)
+        except ValueError:
+            await message.answer("⚠️ 用法：/ping 或 /ping 并发数（正整数）")
+            return
+    if batch_size <= 0:
+        await message.answer("⚠️ 并发数必须为正整数")
+        return
+
     results: dict[str, bool | None] = {m.id: None for m in models}
     status_msg = await message.answer(_build_ping_text(models, results))
 
-    for model in models:
-        ok = await _ping_single_model(model.id)
-        results[model.id] = ok
+    for i in range(0, len(models), batch_size):
+        batch = models[i : i + batch_size]
+        in_progress_ids = {m.id for m in batch}
+        try:
+            await status_msg.edit_text(_build_ping_text(models, results, in_progress_ids=in_progress_ids))
+        except (TelegramBadRequest, TelegramRetryAfter):
+            pass
+
+        batch_results = await asyncio.gather(*(_ping_single_model(m.id) for m in batch))
+        for model, ok in zip(batch, batch_results):
+            results[model.id] = ok
+
         try:
             await status_msg.edit_text(_build_ping_text(models, results))
         except (TelegramBadRequest, TelegramRetryAfter):

@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     auto_tool_model_id: str = Field(default="openai_tool", alias="AUTO_TOOL_MODEL_ID")
     reasoning_mode: str = Field(default="disabled", alias="REASONING_MODE")
     stream_edit_interval_seconds: float = Field(default=0.8, alias="STREAM_EDIT_INTERVAL_SECONDS")
+    ping_parallel_batch_size: int = Field(default=5, alias="PING_PARALLEL_BATCH_SIZE", ge=1)
     max_context_tokens: int = Field(default=32000, alias="MAX_CONTEXT_TOKENS")
     compression_trigger_tokens: int = Field(default=24000, alias="COMPRESSION_TRIGGER_TOKENS")
     recent_window_size: int = Field(default=10, alias="RECENT_WINDOW_SIZE")
